@@ -63,7 +63,7 @@ export default async function handler(
     });
 
     // TODO: replace YOUR_VERCEL_DOMAIN with your real deployed domain
-    const approvalLink = `https://YOUR_VERCEL_DOMAIN/api/admin-approve?token=${token}`;
+    const approvalLink = `https://fixit-backend-pink.vercel.app/api/admin-approve?token=${token}`;
 
     const text =
       `Hi ${fName},\n\n` +
