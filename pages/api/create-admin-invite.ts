@@ -86,8 +86,22 @@ export default async function handler(
     await sendEmail(mail, "FixIt admin approval link", text);
 
     res.status(200).json({ ok: true });
-  } catch (err) {
+  } catch (err: unknown) {
     console.error("create-admin-invite error:", err);
-    res.status(500).json({ error: "Internal server error" });
+
+    let message = "Internal server error";
+    if (err instanceof Error && err.message) {
+      message = `${err.name}: ${err.message}`;
+    } else if (typeof err === "string") {
+      message = err;
+    } else {
+      try {
+        message = JSON.stringify(err);
+      } catch {
+        message = String(err);
+      }
+    }
+
+    res.status(500).json({ error: message });
   }
 }
