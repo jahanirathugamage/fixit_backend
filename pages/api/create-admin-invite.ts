@@ -1,13 +1,24 @@
 // pages/api/create-admin-invite.ts
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import crypto from "crypto";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
+import { setCors } from "@/lib/cors";
 
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse,
 ) {
+  // 🔹 Always set CORS headers
+  setCors(res);
+
+  // 🔹 Handle CORS preflight
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  }
+
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
     return;
@@ -50,6 +61,7 @@ export default async function handler(
       return;
     }
 
+    // Random token for invite
     const token = crypto.randomBytes(32).toString("hex");
 
     const inviteRef = admin.firestore().collection("adminInvites").doc(token);
@@ -62,7 +74,6 @@ export default async function handler(
       status: "pending",
     });
 
-    // TODO: replace YOUR_VERCEL_DOMAIN with your real deployed domain
     const approvalLink = `https://fixit-backend-pink.vercel.app/api/admin-approve?token=${token}`;
 
     const text =
