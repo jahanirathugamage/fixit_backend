@@ -3,10 +3,27 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse,
-) {
+// ✅ CORS helper
+function setCors(res: NextApiResponse) {
+  // If you want to lock it down later, replace '*' with your web origin:
+  // e.g. 'http://localhost:58302' and your deployed web origin.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization",
+  );
+}
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  setCors(res);
+
+  // ✅ Handle preflight
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
     return;
@@ -28,17 +45,11 @@ export default async function handler(
     const callerUid = decoded.uid;
 
     // Caller must be contractor
-    const userSnap = await admin
-      .firestore()
-      .collection("users")
-      .doc(callerUid)
-      .get();
-
+    const userSnap = await admin.firestore().collection("users").doc(callerUid).get();
     const role = userSnap.exists ? (userSnap.data()?.role as string) : null;
+
     if (role !== "contractor") {
-      res
-        .status(403)
-        .json({ error: "Only contractors can create provider accounts." });
+      res.status(403).json({ error: "Only contractors can create provider accounts." });
       return;
     }
 
@@ -61,15 +72,6 @@ export default async function handler(
       return;
     }
 
-    console.log(
-      "Creating provider account for email:",
-      mail,
-      "contractor:",
-      callerUid,
-      "providerDocId:",
-      providerId,
-    );
-
     // Create auth user
     const userRecord = await admin.auth().createUser({
       email: mail,
@@ -78,23 +80,19 @@ export default async function handler(
     });
 
     // users/{uid}
-    await admin
-      .firestore()
-      .collection("users")
-      .doc(userRecord.uid)
-      .set(
-        {
-          role: "provider",
-          firstName: fName,
-          lastName: lName,
-          email: mail,
-          contractorId: callerUid,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      );
+    await admin.firestore().collection("users").doc(userRecord.uid).set(
+      {
+        role: "provider",
+        firstName: fName,
+        lastName: lName,
+        email: mail,
+        contractorId: callerUid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
 
-    // Link in contractors/{callerUid}/providers/{providerDocId}
+    // Link back to contractors/{callerUid}/providers/{providerDocId}
     if (providerId) {
       await admin
         .firestore()
@@ -102,14 +100,10 @@ export default async function handler(
         .doc(callerUid)
         .collection("providers")
         .doc(providerId)
-        .set(
-          {
-            providerUid: userRecord.uid,
-          },
-          { merge: true },
-        );
+        .set({ providerUid: userRecord.uid }, { merge: true });
     }
 
+    // Email provider
     const subject = "Your FixIt provider account";
     const text =
       `Hi ${fName || ""},\n\n` +
@@ -122,8 +116,8 @@ export default async function handler(
 
     await sendEmail(mail, subject, text);
 
-    console.log("Provider account created and email sent to", mail);
-    res.status(200).json({ ok: true });
+    // ✅ IMPORTANT: return providerUid so Flutter can mirror serviceProviders
+    res.status(200).json({ ok: true, providerUid: userRecord.uid });
   } catch (err) {
     console.error("create-provider-account error:", err);
     res.status(500).json({ error: "Failed to create provider account." });
