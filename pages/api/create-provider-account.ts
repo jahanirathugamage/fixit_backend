@@ -2,7 +2,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
-import axios from "axios";
 
 // ✅ CORS helper
 function setCors(res: NextApiResponse) {
@@ -11,20 +10,26 @@ function setCors(res: NextApiResponse) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
-async function geocodeAddress(address: string) {
+type Geo = { lat: number; lng: number };
+
+async function geocodeAddress(address: string): Promise<Geo> {
   const key = process.env.GOOGLE_MAPS_API_KEY;
-  if (!key) throw new Error("Missing GOOGLE_MAPS_API_KEY env var on Vercel");
+  if (!key) throw new Error("Missing GOOGLE_MAPS_API_KEY env var");
 
-  const resp = await axios.get("https://maps.googleapis.com/maps/api/geocode/json", {
-    params: { address, key },
-  });
+  const url =
+    "https://maps.googleapis.com/maps/api/geocode/json" +
+    `?address=${encodeURIComponent(address)}` +
+    `&key=${encodeURIComponent(key)}`;
 
-  if (!resp.data?.results?.length) {
-    throw new Error("Address could not be geocoded");
+  const resp = await fetch(url);
+  const data = await resp.json();
+
+  if (!data?.results?.length) {
+    throw new Error(`Address could not be geocoded: ${address}`);
   }
 
-  const loc = resp.data.results[0].geometry.location; // { lat, lng }
-  return { lat: loc.lat, lng: loc.lng };
+  const loc = data.results[0].geometry.location;
+  return { lat: Number(loc.lat), lng: Number(loc.lng) };
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -69,7 +74,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       firstName = "",
       lastName = "",
       providerDocId = "",
-      address = "", // ✅ accept address
+      address = "",
     } = req.body || {};
 
     const mail = String(email).trim();
@@ -77,23 +82,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const fName = String(firstName).trim();
     const lName = String(lastName).trim();
     const providerId = String(providerDocId).trim();
-    const addr = String(address).trim();
+    const fullAddress = String(address).trim();
 
     if (!mail || !mail.includes("@") || !pw || pw.length < 6) {
       res.status(400).json({ error: "Invalid email or password." });
       return;
-    }
-
-    // ✅ geocode (optional but recommended)
-    let geo: { lat: number; lng: number } | null = null;
-    if (addr) {
-      try {
-        geo = await geocodeAddress(addr);
-      } catch (e) {
-        console.error("Geocoding failed:", e);
-        // don’t fail provider creation if geocode fails
-        geo = null;
-      }
     }
 
     // Create auth user
@@ -127,6 +120,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         .set({ providerUid: userRecord.uid }, { merge: true });
     }
 
+    // ✅ Optional geocode (only if address provided)
+    let geo: Geo | null = null;
+    if (fullAddress.length > 5) {
+      try {
+        geo = await geocodeAddress(fullAddress);
+      } catch (e) {
+        console.error("Geocoding failed:", e);
+        // don't fail the whole request just because geocode failed
+        geo = null;
+      }
+    }
+
     // Email provider
     const subject = "Your FixIt provider account";
     const text =
@@ -140,7 +145,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     await sendEmail(mail, subject, text);
 
-    // ✅ Return providerUid + geo to Flutter
+    // ✅ Return providerUid + geo (if available)
     res.status(200).json({ ok: true, providerUid: userRecord.uid, geo });
   } catch (err) {
     console.error("create-provider-account error:", err);
