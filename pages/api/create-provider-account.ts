@@ -2,17 +2,29 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
+import axios from "axios";
 
 // ✅ CORS helper
 function setCors(res: NextApiResponse) {
-  // If you want to lock it down later, replace '*' with your web origin:
-  // e.g. 'http://localhost:58302' and your deployed web origin.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization",
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+async function geocodeAddress(address: string) {
+  const key = process.env.GOOGLE_MAPS_API_KEY;
+  if (!key) throw new Error("Missing GOOGLE_MAPS_API_KEY env var on Vercel");
+
+  const resp = await axios.get("https://maps.googleapis.com/maps/api/geocode/json", {
+    params: { address, key },
+  });
+
+  if (!resp.data?.results?.length) {
+    throw new Error("Address could not be geocoded");
+  }
+
+  const loc = resp.data.results[0].geometry.location; // { lat, lng }
+  return { lat: loc.lat, lng: loc.lng };
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -32,9 +44,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     // Firebase ID token
     const authHeader = req.headers.authorization || "";
-    const idToken = authHeader.startsWith("Bearer ")
-      ? authHeader.slice(7)
-      : null;
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
 
     if (!idToken) {
       res.status(401).json({ error: "Missing auth token" });
@@ -59,6 +69,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       firstName = "",
       lastName = "",
       providerDocId = "",
+      address = "", // ✅ accept address
     } = req.body || {};
 
     const mail = String(email).trim();
@@ -66,10 +77,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const fName = String(firstName).trim();
     const lName = String(lastName).trim();
     const providerId = String(providerDocId).trim();
+    const addr = String(address).trim();
 
     if (!mail || !mail.includes("@") || !pw || pw.length < 6) {
       res.status(400).json({ error: "Invalid email or password." });
       return;
+    }
+
+    // ✅ geocode (optional but recommended)
+    let geo: { lat: number; lng: number } | null = null;
+    if (addr) {
+      try {
+        geo = await geocodeAddress(addr);
+      } catch (e) {
+        console.error("Geocoding failed:", e);
+        // don’t fail provider creation if geocode fails
+        geo = null;
+      }
     }
 
     // Create auth user
@@ -116,8 +140,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     await sendEmail(mail, subject, text);
 
-    // ✅ IMPORTANT: return providerUid so Flutter can mirror serviceProviders
-    res.status(200).json({ ok: true, providerUid: userRecord.uid });
+    // ✅ Return providerUid + geo to Flutter
+    res.status(200).json({ ok: true, providerUid: userRecord.uid, geo });
   } catch (err) {
     console.error("create-provider-account error:", err);
     res.status(500).json({ error: "Failed to create provider account." });
