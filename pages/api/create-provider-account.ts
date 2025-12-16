@@ -1,5 +1,3 @@
-// pages/api/create-provider-account.ts
-
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
@@ -28,13 +26,10 @@ async function geocodeAddress(address: string): Promise<Geo> {
   const url =
     "https://nominatim.openstreetmap.org/search" +
     `?q=${encodeURIComponent(address)}` +
-    "&format=json" +
-    "&limit=1" +
-    "&addressdetails=0";
+    "&format=json&limit=1&addressdetails=0";
 
   const resp = await fetch(url, {
     headers: {
-      // Put something identifying here. If you have a support email, use it.
       "User-Agent": "FixIt-Academic-Project (geocoding)",
       "Accept-Language": "en",
     },
