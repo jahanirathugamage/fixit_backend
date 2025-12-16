@@ -1,9 +1,9 @@
 // pages/api/create-provider-account.ts
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
 
-// ✅ CORS helper
 function setCors(res: NextApiResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
@@ -12,62 +12,62 @@ function setCors(res: NextApiResponse) {
 
 type Geo = { lat: number; lng: number };
 
+/**
+ * OpenStreetMap (Nominatim) geocoding
+ * - No API key, no billing
+ * - IMPORTANT: Nominatim requires identifying User-Agent
+ */
 async function geocodeAddress(address: string): Promise<Geo> {
-  const key = process.env.GOOGLE_MAPS_API_KEY;
-  if (!key) throw new Error("Missing GOOGLE_MAPS_API_KEY env var");
-
   const url =
-    "https://maps.googleapis.com/maps/api/geocode/json" +
-    `?address=${encodeURIComponent(address)}` +
-    `&key=${encodeURIComponent(key)}`;
+    "https://nominatim.openstreetmap.org/search" +
+    `?q=${encodeURIComponent(address)}` +
+    "&format=json" +
+    "&limit=1" +
+    "&addressdetails=0";
 
-  const resp = await fetch(url);
-  const data = await resp.json();
+  const resp = await fetch(url, {
+    headers: {
+      // Put something identifying here. If you have a support email, use it.
+      "User-Agent": "FixIt-Academic-Project (geocoding)",
+      "Accept-Language": "en",
+    },
+  });
 
-  if (!data?.results?.length) {
-    throw new Error(`Address could not be geocoded: ${address}`);
+  if (!resp.ok) {
+    throw new Error(`Nominatim HTTP ${resp.status}`);
   }
 
-  const loc = data.results[0].geometry.location;
-  return { lat: Number(loc.lat), lng: Number(loc.lng) };
+  const data = (await resp.json()) as Array<{ lat: string; lon: string }>;
+
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("Address could not be geocoded (no results)");
+  }
+
+  return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   setCors(res);
 
-  // ✅ Handle preflight
-  if (req.method === "OPTIONS") {
-    res.status(204).end();
-    return;
-  }
-
-  if (req.method !== "POST") {
-    res.status(405).json({ error: "Method not allowed" });
-    return;
-  }
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    // Firebase ID token
+    // ---- Auth: require contractor caller ----
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-
-    if (!idToken) {
-      res.status(401).json({ error: "Missing auth token" });
-      return;
-    }
+    if (!idToken) return res.status(401).json({ error: "Missing auth token" });
 
     const decoded = await admin.auth().verifyIdToken(idToken);
     const callerUid = decoded.uid;
 
-    // Caller must be contractor
     const userSnap = await admin.firestore().collection("users").doc(callerUid).get();
     const role = userSnap.exists ? (userSnap.data()?.role as string) : null;
-
     if (role !== "contractor") {
-      res.status(403).json({ error: "Only contractors can create provider accounts." });
-      return;
+      return res.status(403).json({ error: "Only contractors can create provider accounts." });
     }
 
+    // ---- Body ----
     const {
       email = "",
       password = "",
@@ -85,19 +85,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const fullAddress = String(address).trim();
 
     if (!mail || !mail.includes("@") || !pw || pw.length < 6) {
-      res.status(400).json({ error: "Invalid email or password." });
-      return;
+      return res.status(400).json({ error: "Invalid email or password." });
     }
 
-    // Create auth user
+    // ---- Create Auth user ----
     const userRecord = await admin.auth().createUser({
       email: mail,
       password: pw,
       displayName: `${fName} ${lName}`.trim() || undefined,
     });
 
-    // users/{uid}
-    await admin.firestore().collection("users").doc(userRecord.uid).set(
+    const providerUid = userRecord.uid;
+
+    // ---- Base user profile ----
+    await admin.firestore().collection("users").doc(providerUid).set(
       {
         role: "provider",
         firstName: fName,
@@ -109,7 +110,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       { merge: true },
     );
 
-    // Link back to contractors/{callerUid}/providers/{providerDocId}
+    // ---- Link provider to contractor's subcollection (if providerDocId provided) ----
     if (providerId) {
       await admin
         .firestore()
@@ -117,22 +118,52 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         .doc(callerUid)
         .collection("providers")
         .doc(providerId)
-        .set({ providerUid: userRecord.uid }, { merge: true });
+        .set({ providerUid }, { merge: true });
     }
 
-    // ✅ Optional geocode (only if address provided)
+    // ---- Geocode address (optional) ----
     let geo: Geo | null = null;
+
     if (fullAddress.length > 5) {
       try {
         geo = await geocodeAddress(fullAddress);
+
+        // Save geocoded location to provider docs (so app can use it later)
+        const geoPoint = new admin.firestore.GeoPoint(geo.lat, geo.lng);
+
+        // Recommended: top-level providers/{providerUid}
+        await admin.firestore().collection("providers").doc(providerUid).set(
+          {
+            providerUid,
+            address: fullAddress,
+            location: geoPoint,
+            locationUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            managedBy: admin.firestore().doc(`contractors/${callerUid}`),
+          },
+          { merge: true },
+        );
+
+        // Optional: if you also use serviceProviders/{providerUid} as "master table"
+        await admin.firestore().collection("serviceProviders").doc(providerUid).set(
+          {
+            providerEmail: mail,
+            providerId: admin.firestore().doc(`users/${providerUid}`),
+            managedBy: admin.firestore().doc(`contractors/${callerUid}`),
+            address: {
+              fullAddress,
+            },
+            location: geoPoint,
+            locationUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
       } catch (e) {
         console.error("Geocoding failed:", e);
-        // don't fail the whole request just because geocode failed
-        geo = null;
+        // We still proceed (account created), geo stays null
       }
     }
 
-    // Email provider
+    // ---- Email provider their credentials ----
     const subject = "Your FixIt provider account";
     const text =
       `Hi ${fName || ""},\n\n` +
@@ -145,10 +176,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     await sendEmail(mail, subject, text);
 
-    // ✅ Return providerUid + geo (if available)
-    res.status(200).json({ ok: true, providerUid: userRecord.uid, geo });
+    return res.status(200).json({ ok: true, providerUid, geo });
   } catch (err) {
     console.error("create-provider-account error:", err);
-    res.status(500).json({ error: "Failed to create provider account." });
+    return res.status(500).json({ error: "Failed to create provider account." });
   }
 }
