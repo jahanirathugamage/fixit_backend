@@ -17,13 +17,6 @@ type GeocodeMeta = {
   displayName?: string | null;
 };
 
-/**
- * OpenStreetMap (Nominatim) geocoding
- * - No API key, no billing
- * - IMPORTANT: Nominatim requires identifying User-Agent
- *
- * Returns null if geocoding fails (so provider creation can still succeed).
- */
 async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: GeocodeMeta } | null> {
   const query = address.trim();
   if (query.length < 6) return null;
@@ -36,7 +29,7 @@ async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: Geocod
   try {
     const resp = await fetch(url, {
       headers: {
-        // Put something identifying here. Ideally include a contact email for good practice.
+        // ⚠️ Put something identifying here (recommended by Nominatim usage policy)
         "User-Agent": "FixIt-Academic-Project/1.0 (geocoding; contact: your-email@example.com)",
         Accept: "application/json",
         "Accept-Language": "en",
@@ -107,20 +100,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       lastName = "",
       providerDocId = "",
       address = "",
+      languages = [],
+      skills = [],
     } = req.body || {};
 
     const mail = String(email).trim().toLowerCase();
     const pw = String(password).trim();
     const fName = String(firstName).trim();
     const lName = String(lastName).trim();
-    const providerId = String(providerDocId).trim();
+    const providerId = String(providerDocId).trim(); // contractor subcollection doc id
     const fullAddress = String(address).trim();
+
+    const langs = Array.isArray(languages) ? languages : [];
+    const sks = Array.isArray(skills) ? skills : [];
 
     if (!mail || !mail.includes("@")) {
       return res.status(400).json({ error: "Invalid email." });
     }
     if (!pw || pw.length < 6) {
       return res.status(400).json({ error: "Password must be at least 6 characters." });
+    }
+
+    // If your flow ALWAYS creates provider details under contractor first, you probably want this required:
+    if (!providerId) {
+      return res.status(400).json({ error: "Missing providerDocId (contractor providers doc id)." });
     }
 
     // ---- Create Auth user ----
@@ -145,38 +148,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       { merge: true },
     );
 
-    // ---- Link provider to contractor's subcollection (if providerDocId provided) ----
-    if (providerId) {
-      await admin
-        .firestore()
-        .collection("contractors")
-        .doc(callerUid)
-        .collection("providers")
-        .doc(providerId)
-        .set({ providerUid }, { merge: true });
-    }
-
-    // ---- Always create/merge provider profile docs (even if geocode fails) ----
     const contractorRef = admin.firestore().doc(`contractors/${callerUid}`);
     const userRef = admin.firestore().doc(`users/${providerUid}`);
-
-    // Basic payload shared by both docs
-    const baseProviderPayload = {
-      providerUid,
-      address: fullAddress || "",
-      managedBy: contractorRef,
-      updatedAt: FieldValue.serverTimestamp(),
-    };
 
     // ---- Geocode address (best-effort) ----
     const geocoded = await geocodeAddress(fullAddress);
     let geo: Geo | null = null;
 
-    // Build optional fields if we have geo
     const geoFields: Record<string, any> = {};
     if (geocoded) {
       geo = geocoded.geo;
-      geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
+      geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng); // ✅ Firestore GeoPoint
       geoFields.geocode = {
         ...geocoded.meta,
         updatedAt: FieldValue.serverTimestamp(),
@@ -184,31 +166,55 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
     }
 
-    // providers/{providerUid}  (your app can read from here)
-    await admin.firestore().collection("providers").doc(providerUid).set(
-      {
-        ...baseProviderPayload,
-        ...geoFields,
-      },
-      { merge: true },
-    );
+    // ---- 1) Save/merge provider details under contractor first ----
+    // contractors/{contractorUid}/providers/{providerDocId}
+    await admin
+      .firestore()
+      .collection("contractors")
+      .doc(callerUid)
+      .collection("providers")
+      .doc(providerId)
+      .set(
+        {
+          providerUid,
+          email: mail,
+          firstName: fName,
+          lastName: lName,
+          address: fullAddress || "",
+          languages: langs,
+          skills: sks,
+          managedBy: contractorRef,
+          updatedAt: FieldValue.serverTimestamp(),
+          ...geoFields, // ✅ also store location/geocode here if you want
+        },
+        { merge: true },
+      );
 
-    // serviceProviders/{providerUid} (your “master table”)
+    // ---- 2) Mirror the queryable row into serviceProviders/{providerUid} ----
     await admin.firestore().collection("serviceProviders").doc(providerUid).set(
       {
         providerEmail: mail,
         providerId: userRef,
         managedBy: contractorRef,
+
+        // keep your current address structure
         address: {
           fullAddress: fullAddress || "",
         },
-        ...geoFields,
+
+        // mirror useful matching fields (optional)
+        firstName: fName,
+        lastName: lName,
+        languages: langs,
+        // skills: sks,
+
+        ...geoFields, // ✅ location + geocode + locationUpdatedAt
+        updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
 
     // ---- Email provider their credentials ----
-    // Note: emailing plaintext passwords isn't ideal for production, but keeping your current behavior.
     const subject = "Your FixIt provider account";
     const text =
       `Hi ${fName || ""},\n\n` +
@@ -221,9 +227,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     await sendEmail(mail, subject, text);
 
-    return res.status(200).json({ ok: true, providerUid, geo });
-  } catch (err) {
+    return res.status(200).json({ ok: true, providerUid, geo, version: "svcProviders-v2" });
+  } catch (err: any) {
     console.error("create-provider-account error:", err);
-    return res.status(500).json({ error: "Failed to create provider account." });
+
+    //Firebase Admin errors often have these fields
+    const code = err.code || null;
+    const message = err.message || null;
+
+    return res.status(500).json({ 
+      error: "Failed to create provider account.",
+      code,
+      message, });
   }
 }
