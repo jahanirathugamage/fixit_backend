@@ -1,13 +1,8 @@
+// relative path: pages/api/create-provider-account.ts
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
-
-interface ContractorProviderData {
-  firstName?: string;
-  lastName?: string;
-  languages?: string[];
-  skills?: unknown[]; // you can refine this later if you like
-}
 
 function setCors(res: NextApiResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -16,36 +11,68 @@ function setCors(res: NextApiResponse) {
 }
 
 type Geo = { lat: number; lng: number };
+type GeocodeMeta = {
+  source: "nominatim";
+  query: string;
+  displayName?: string | null;
+};
 
 /**
  * OpenStreetMap (Nominatim) geocoding
  * - No API key, no billing
  * - IMPORTANT: Nominatim requires identifying User-Agent
+ *
+ * Returns null if geocoding fails (so provider creation can still succeed).
  */
-async function geocodeAddress(address: string): Promise<Geo> {
+async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: GeocodeMeta } | null> {
+  const query = address.trim();
+  if (query.length < 6) return null;
+
   const url =
     "https://nominatim.openstreetmap.org/search" +
-    `?q=${encodeURIComponent(address)}` +
-    "&format=json&limit=1&addressdetails=0";
+    `?q=${encodeURIComponent(query)}` +
+    "&format=json&limit=1&addressdetails=1";
 
-  const resp = await fetch(url, {
-    headers: {
-      "User-Agent": "FixIt-Academic-Project (geocoding)",
-      "Accept-Language": "en",
-    },
-  });
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        // Put something identifying here. Ideally include a contact email for good practice.
+        "User-Agent": "FixIt-Academic-Project/1.0 (geocoding; contact: your-email@example.com)",
+        Accept: "application/json",
+        "Accept-Language": "en",
+      },
+    });
 
-  if (!resp.ok) {
-    throw new Error(`Nominatim HTTP ${resp.status}`);
+    if (!resp.ok) {
+      console.error(`Nominatim HTTP ${resp.status}`);
+      return null;
+    }
+
+    const data = (await resp.json()) as Array<{
+      lat: string;
+      lon: string;
+      display_name?: string;
+    }>;
+
+    if (!Array.isArray(data) || data.length === 0) return null;
+
+    const lat = Number(data[0].lat);
+    const lng = Number(data[0].lon);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+    return {
+      geo: { lat, lng },
+      meta: {
+        source: "nominatim",
+        query,
+        displayName: data[0].display_name ?? null,
+      },
+    };
+  } catch (e) {
+    console.error("Nominatim fetch failed:", e);
+    return null;
   }
-
-  const data = (await resp.json()) as Array<{ lat: string; lon: string }>;
-
-  if (!Array.isArray(data) || data.length === 0) {
-    throw new Error("Address could not be geocoded (no results)");
-  }
-
-  return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -53,6 +80,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  const FieldValue = admin.firestore.FieldValue;
 
   try {
     // ---- Auth: require contractor caller ----
@@ -65,6 +94,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const userSnap = await admin.firestore().collection("users").doc(callerUid).get();
     const role = userSnap.exists ? (userSnap.data()?.role as string) : null;
+
     if (role !== "contractor") {
       return res.status(403).json({ error: "Only contractors can create provider accounts." });
     }
@@ -79,15 +109,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       address = "",
     } = req.body || {};
 
-    const mail = String(email).trim();
+    const mail = String(email).trim().toLowerCase();
     const pw = String(password).trim();
     const fName = String(firstName).trim();
     const lName = String(lastName).trim();
     const providerId = String(providerDocId).trim();
     const fullAddress = String(address).trim();
 
-    if (!mail || !mail.includes("@") || !pw || pw.length < 6) {
-      return res.status(400).json({ error: "Invalid email or password." });
+    if (!mail || !mail.includes("@")) {
+      return res.status(400).json({ error: "Invalid email." });
+    }
+    if (!pw || pw.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters." });
     }
 
     // ---- Create Auth user ----
@@ -107,7 +140,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         lastName: lName,
         email: mail,
         contractorId: callerUid,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
@@ -123,49 +156,59 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         .set({ providerUid }, { merge: true });
     }
 
-    // ---- Geocode address (optional) ----
+    // ---- Always create/merge provider profile docs (even if geocode fails) ----
+    const contractorRef = admin.firestore().doc(`contractors/${callerUid}`);
+    const userRef = admin.firestore().doc(`users/${providerUid}`);
+
+    // Basic payload shared by both docs
+    const baseProviderPayload = {
+      providerUid,
+      address: fullAddress || "",
+      managedBy: contractorRef,
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    // ---- Geocode address (best-effort) ----
+    const geocoded = await geocodeAddress(fullAddress);
     let geo: Geo | null = null;
 
-    if (fullAddress.length > 5) {
-      try {
-        geo = await geocodeAddress(fullAddress);
-
-        // Save geocoded location to provider docs (so app can use it later)
-        const geoPoint = new admin.firestore.GeoPoint(geo.lat, geo.lng);
-
-        // Recommended: top-level providers/{providerUid}
-        await admin.firestore().collection("providers").doc(providerUid).set(
-          {
-            providerUid,
-            address: fullAddress,
-            location: geoPoint,
-            locationUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            managedBy: admin.firestore().doc(`contractors/${callerUid}`),
-          },
-          { merge: true },
-        );
-
-        // Optional: if you also use serviceProviders/{providerUid} as "master table"
-        await admin.firestore().collection("serviceProviders").doc(providerUid).set(
-          {
-            providerEmail: mail,
-            providerId: admin.firestore().doc(`users/${providerUid}`),
-            managedBy: admin.firestore().doc(`contractors/${callerUid}`),
-            address: {
-              fullAddress,
-            },
-            location: geoPoint,
-            locationUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true },
-        );
-      } catch (e) {
-        console.error("Geocoding failed:", e);
-        // We still proceed (account created), geo stays null
-      }
+    // Build optional fields if we have geo
+    const geoFields: Record<string, any> = {};
+    if (geocoded) {
+      geo = geocoded.geo;
+      geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
+      geoFields.geocode = {
+        ...geocoded.meta,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+      geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
     }
 
+    // providers/{providerUid}  (your app can read from here)
+    await admin.firestore().collection("providers").doc(providerUid).set(
+      {
+        ...baseProviderPayload,
+        ...geoFields,
+      },
+      { merge: true },
+    );
+
+    // serviceProviders/{providerUid} (your “master table”)
+    await admin.firestore().collection("serviceProviders").doc(providerUid).set(
+      {
+        providerEmail: mail,
+        providerId: userRef,
+        managedBy: contractorRef,
+        address: {
+          fullAddress: fullAddress || "",
+        },
+        ...geoFields,
+      },
+      { merge: true },
+    );
+
     // ---- Email provider their credentials ----
+    // Note: emailing plaintext passwords isn't ideal for production, but keeping your current behavior.
     const subject = "Your FixIt provider account";
     const text =
       `Hi ${fName || ""},\n\n` +
