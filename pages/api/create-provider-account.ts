@@ -36,19 +36,18 @@ type GeocodeMeta = {
 };
 
 async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: GeocodeMeta } | null> {
-  const query = address.trim();
+  const query = String(address || "").trim();
   if (query.length < 6) return null;
 
-  const url =
-    "https://nominatim.openstreetmap.org/search" +
-    `?q=${encodeURIComponent(query)}` +
-    "&format=json&limit=1&addressdetails=1&countrycodes=lk" +
-    "&countrycodes=lk";
+  async function callNominatim(q: string) {
+    const url =
+      "https://nominatim.openstreetmap.org/search" +
+      `?q=${encodeURIComponent(q)}` +
+      "&format=json&limit=3&addressdetails=1" +
+      "&countrycodes=lk";
 
-  try {
     const resp = await fetch(url, {
       headers: {
-        // ⚠️ Put something identifying here (recommended by Nominatim usage policy)
         "User-Agent": "FixIt-Academic-Project/1.0 (geocoding; contact: your-email@example.com)",
         Accept: "application/json",
         "Accept-Language": "en",
@@ -57,17 +56,31 @@ async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: Geocod
 
     if (!resp.ok) {
       console.error(`Nominatim HTTP ${resp.status}`);
-      return null;
+      return [] as Array<{ lat: string; lon: string; display_name?: string }>;
     }
 
-    const data = (await resp.json()) as Array<{
-      lat: string;
-      lon: string;
-      display_name?: string;
-    }>;
+    const data = (await resp.json()) as Array<{ lat: string; lon: string; display_name?: string }>;
+    return Array.isArray(data) ? data : [];
+  }
 
-    if (!Array.isArray(data) || data.length === 0) return null;
+  try {
+    // 1) First try as-is
+    let data = await callNominatim(query);
 
+    // 2) Fallback: remove leading house number like "4," or "No. 18A,"
+    if (!data.length) {
+      const fallback = query
+        .replace(/^\s*(no\.?\s*)?\d+[a-zA-Z0-9\/-]*\s*,\s*/i, "")
+        .trim();
+
+      if (fallback && fallback !== query) {
+        data = await callNominatim(fallback);
+      }
+    }
+
+    if (!data.length) return null;
+
+    // Take first candidate
     const lat = Number(data[0].lat);
     const lng = Number(data[0].lon);
 
@@ -86,6 +99,8 @@ async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: Geocod
     return null;
   }
 }
+
+
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   setCors(res);
