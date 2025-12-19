@@ -42,7 +42,8 @@ async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: Geocod
   const url =
     "https://nominatim.openstreetmap.org/search" +
     `?q=${encodeURIComponent(query)}` +
-    "&format=json&limit=1&addressdetails=1&countrycodes=lk";
+    "&format=json&limit=1&addressdetails=1&countrycodes=lk" +
+    "&countrycodes=lk";
 
   try {
     const resp = await fetch(url, {
