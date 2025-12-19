@@ -4,6 +4,24 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
 
+function normalizeAddress(input: string): string {
+  const raw = String(input || "").trim();
+
+  // split, trim, remove empties
+  const parts = raw.split(",").map(p => p.trim()).filter(Boolean);
+
+  // remove duplicate consecutive parts (e.g. "Sri Lanka, Sri Lanka")
+  const deduped: string[] = [];
+  for (const p of parts) {
+    if (deduped.length === 0 || deduped[deduped.length - 1].toLowerCase() !== p.toLowerCase()) {
+      deduped.push(p);
+    }
+  }
+
+  return deduped.join(", ");
+}
+
+
 function setCors(res: NextApiResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
@@ -24,7 +42,7 @@ async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: Geocod
   const url =
     "https://nominatim.openstreetmap.org/search" +
     `?q=${encodeURIComponent(query)}` +
-    "&format=json&limit=1&addressdetails=1";
+    "&format=json&limit=1&addressdetails=1&countrycodes=lk";
 
   try {
     const resp = await fetch(url, {
@@ -109,7 +127,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const fName = String(firstName).trim();
     const lName = String(lastName).trim();
     const providerId = String(providerDocId).trim(); // contractor subcollection doc id
-    const fullAddress = String(address).trim();
+    const fullAddress = normalizeAddress(address).trim();
 
     const langs = Array.isArray(languages) ? languages : [];
     const sks = Array.isArray(skills) ? skills : [];
@@ -152,19 +170,43 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const userRef = admin.firestore().doc(`users/${providerUid}`);
 
     // ---- Geocode address (best-effort) ----
+    // const geocoded = await geocodeAddress(fullAddress);
+    // let geo: Geo | null = null;
+
+    // const geoFields: Record<string, any> = {};
+    // if (geocoded) {
+    //   geo = geocoded.geo;
+    //   geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng); // ✅ Firestore GeoPoint
+    //   geoFields.geocode = {
+    //     ...geocoded.meta,
+    //     updatedAt: FieldValue.serverTimestamp(),
+    //   };
+    //   geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
+    // }
+
     const geocoded = await geocodeAddress(fullAddress);
     let geo: Geo | null = null;
 
-    const geoFields: Record<string, any> = {};
+    const geoFields: Record<string, any> = {
+      geocode: {
+        source: "nominatim",
+        query: fullAddress,
+        status: "no_results",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+    };
+
     if (geocoded) {
       geo = geocoded.geo;
-      geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng); // ✅ Firestore GeoPoint
+      geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
+      geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
       geoFields.geocode = {
         ...geocoded.meta,
+        status: "ok",
         updatedAt: FieldValue.serverTimestamp(),
       };
-      geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
     }
+
 
     // ---- 1) Save/merge provider details under contractor first ----
     // contractors/{contractorUid}/providers/{providerDocId}
