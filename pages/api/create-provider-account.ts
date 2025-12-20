@@ -6,21 +6,23 @@ import { sendEmail } from "@/lib/mailer";
 
 function normalizeAddress(input: string): string {
   const raw = String(input || "").trim();
+  const parts = raw
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
 
-  // split, trim, remove empties
-  const parts = raw.split(",").map(p => p.trim()).filter(Boolean);
-
-  // remove duplicate consecutive parts (e.g. "Sri Lanka, Sri Lanka")
   const deduped: string[] = [];
   for (const p of parts) {
-    if (deduped.length === 0 || deduped[deduped.length - 1].toLowerCase() !== p.toLowerCase()) {
+    if (
+      deduped.length === 0 ||
+      deduped[deduped.length - 1].toLowerCase() !== p.toLowerCase()
+    ) {
       deduped.push(p);
     }
   }
 
   return deduped.join(", ");
 }
-
 
 function setCors(res: NextApiResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -29,13 +31,31 @@ function setCors(res: NextApiResponse) {
 }
 
 type Geo = { lat: number; lng: number };
+
 type GeocodeMeta = {
-  source: "nominatim";
+  source: "nominatim" | "pin";
   query: string;
   displayName?: string | null;
+  status: "ok" | "no_results" | "pin";
+  updatedAt: admin.firestore.FieldValue;
 };
 
-async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: GeocodeMeta } | null> {
+function parsePinnedLocation(raw: any): Geo | null {
+  if (!raw || typeof raw !== "object") return null;
+
+  const lat = Number((raw as any).lat);
+  const lng = Number((raw as any).lng);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90) return null;
+  if (lng < -180 || lng > 180) return null;
+
+  return { lat, lng };
+}
+
+async function geocodeAddress(
+  address: string,
+): Promise<{ geo: Geo; meta: { query: string; displayName?: string | null } } | null> {
   const query = String(address || "").trim();
   if (query.length < 6) return null;
 
@@ -48,7 +68,8 @@ async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: Geocod
 
     const resp = await fetch(url, {
       headers: {
-        "User-Agent": "FixIt-Academic-Project/1.0 (geocoding; contact: your-email@example.com)",
+        "User-Agent":
+          "FixIt-Academic-Project/1.0 (geocoding; contact: your-email@example.com)",
         Accept: "application/json",
         "Accept-Language": "en",
       },
@@ -59,15 +80,18 @@ async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: Geocod
       return [] as Array<{ lat: string; lon: string; display_name?: string }>;
     }
 
-    const data = (await resp.json()) as Array<{ lat: string; lon: string; display_name?: string }>;
+    const data = (await resp.json()) as Array<{
+      lat: string;
+      lon: string;
+      display_name?: string;
+    }>;
+
     return Array.isArray(data) ? data : [];
   }
 
   try {
-    // 1) First try as-is
     let data = await callNominatim(query);
 
-    // 2) Fallback: remove leading house number like "4," or "No. 18A,"
     if (!data.length) {
       const fallback = query
         .replace(/^\s*(no\.?\s*)?\d+[a-zA-Z0-9\/-]*\s*,\s*/i, "")
@@ -80,16 +104,13 @@ async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: Geocod
 
     if (!data.length) return null;
 
-    // Take first candidate
     const lat = Number(data[0].lat);
     const lng = Number(data[0].lon);
-
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
 
     return {
       geo: { lat, lng },
       meta: {
-        source: "nominatim",
         query,
         displayName: data[0].display_name ?? null,
       },
@@ -100,8 +121,6 @@ async function geocodeAddress(address: string): Promise<{ geo: Geo; meta: Geocod
   }
 }
 
-
-
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   setCors(res);
 
@@ -111,7 +130,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const FieldValue = admin.firestore.FieldValue;
 
   try {
-    // ---- Auth: require contractor caller ----
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: "Missing auth token" });
@@ -126,7 +144,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(403).json({ error: "Only contractors can create provider accounts." });
     }
 
-    // ---- Body ----
     const {
       email = "",
       password = "",
@@ -136,13 +153,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       address = "",
       languages = [],
       skills = [],
+      location = null, // ✅ {lat,lng} from pick pin
     } = req.body || {};
 
     const mail = String(email).trim().toLowerCase();
     const pw = String(password).trim();
     const fName = String(firstName).trim();
     const lName = String(lastName).trim();
-    const providerId = String(providerDocId).trim(); // contractor subcollection doc id
+    const providerId = String(providerDocId).trim();
     const fullAddress = normalizeAddress(address).trim();
 
     const langs = Array.isArray(languages) ? languages : [];
@@ -154,13 +172,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!pw || pw.length < 6) {
       return res.status(400).json({ error: "Password must be at least 6 characters." });
     }
-
-    // If your flow ALWAYS creates provider details under contractor first, you probably want this required:
     if (!providerId) {
-      return res.status(400).json({ error: "Missing providerDocId (contractor providers doc id)." });
+      return res.status(400).json({
+        error: "Missing providerDocId (contractor providers doc id).",
+      });
     }
 
-    // ---- Create Auth user ----
     const userRecord = await admin.auth().createUser({
       email: mail,
       password: pw,
@@ -169,7 +186,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const providerUid = userRecord.uid;
 
-    // ---- Base user profile ----
     await admin.firestore().collection("users").doc(providerUid).set(
       {
         role: "provider",
@@ -185,47 +201,48 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const contractorRef = admin.firestore().doc(`contractors/${callerUid}`);
     const userRef = admin.firestore().doc(`users/${providerUid}`);
 
-    // ---- Geocode address (best-effort) ----
-    // const geocoded = await geocodeAddress(fullAddress);
-    // let geo: Geo | null = null;
+    // ✅ Priority: pin -> nominatim -> none
+    const pinned = parsePinnedLocation(location);
 
-    // const geoFields: Record<string, any> = {};
-    // if (geocoded) {
-    //   geo = geocoded.geo;
-    //   geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng); // ✅ Firestore GeoPoint
-    //   geoFields.geocode = {
-    //     ...geocoded.meta,
-    //     updatedAt: FieldValue.serverTimestamp(),
-    //   };
-    //   geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
-    // }
-
-    const geocoded = await geocodeAddress(fullAddress);
     let geo: Geo | null = null;
+    const geoFields: Record<string, any> = {};
 
-    const geoFields: Record<string, any> = {
-      geocode: {
-        source: "nominatim",
-        query: fullAddress,
-        status: "no_results",
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-    };
-
-    if (geocoded) {
-      geo = geocoded.geo;
+    if (pinned) {
+      geo = pinned;
       geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
       geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
       geoFields.geocode = {
-        ...geocoded.meta,
-        status: "ok",
+        source: "pin",
+        query: fullAddress || "",
+        displayName: null,
+        status: "pin",
         updatedAt: FieldValue.serverTimestamp(),
-      };
+      } satisfies GeocodeMeta;
+    } else {
+      geoFields.geocode = {
+        source: "nominatim",
+        query: fullAddress || "",
+        displayName: null,
+        status: "no_results",
+        updatedAt: FieldValue.serverTimestamp(),
+      } satisfies GeocodeMeta;
+
+      const geocoded = await geocodeAddress(fullAddress);
+      if (geocoded) {
+        geo = geocoded.geo;
+        geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
+        geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
+        geoFields.geocode = {
+          source: "nominatim",
+          query: geocoded.meta.query,
+          displayName: geocoded.meta.displayName ?? null,
+          status: "ok",
+          updatedAt: FieldValue.serverTimestamp(),
+        } satisfies GeocodeMeta;
+      }
     }
 
-
-    // ---- 1) Save/merge provider details under contractor first ----
-    // contractors/{contractorUid}/providers/{providerDocId}
+    // 1) contractor subdoc
     await admin
       .firestore()
       .collection("contractors")
@@ -243,36 +260,34 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           skills: sks,
           managedBy: contractorRef,
           updatedAt: FieldValue.serverTimestamp(),
-          ...geoFields, // ✅ also store location/geocode here if you want
+          ...geoFields,
         },
         { merge: true },
       );
 
-    // ---- 2) Mirror the queryable row into serviceProviders/{providerUid} ----
+    // 2) mirror into serviceProviders/{providerUid}
     await admin.firestore().collection("serviceProviders").doc(providerUid).set(
       {
+        providerUid,
         providerEmail: mail,
         providerId: userRef,
         managedBy: contractorRef,
+        contractorId: callerUid,
 
-        // keep your current address structure
         address: {
           fullAddress: fullAddress || "",
         },
 
-        // mirror useful matching fields (optional)
         firstName: fName,
         lastName: lName,
         languages: langs,
-        // skills: sks,
 
-        ...geoFields, // ✅ location + geocode + locationUpdatedAt
+        ...geoFields,
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
 
-    // ---- Email provider their credentials ----
     const subject = "Your FixIt provider account";
     const text =
       `Hi ${fName || ""},\n\n` +
@@ -285,17 +300,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     await sendEmail(mail, subject, text);
 
-    return res.status(200).json({ ok: true, providerUid, geo, version: "svcProviders-v2" });
+    return res.status(200).json({ ok: true, providerUid, geo, version: "svcProviders-v3-pin" });
   } catch (err: any) {
     console.error("create-provider-account error:", err);
 
-    //Firebase Admin errors often have these fields
     const code = err.code || null;
     const message = err.message || null;
 
-    return res.status(500).json({ 
+    return res.status(500).json({
       error: "Failed to create provider account.",
       code,
-      message, });
+      message,
+    });
   }
 }
