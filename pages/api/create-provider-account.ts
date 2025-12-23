@@ -1,5 +1,3 @@
-// relative path: pages/api/create-provider-account.ts
-
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
@@ -11,6 +9,7 @@ function normalizeAddress(input: string): string {
     .map((p) => p.trim())
     .filter(Boolean);
 
+  // Remove consecutive duplicates (e.g. "Sri Lanka, Sri Lanka")
   const deduped: string[] = [];
   for (const p of parts) {
     if (
@@ -39,6 +38,30 @@ type GeocodeMeta = {
   status: "ok" | "no_results" | "pin";
   updatedAt: admin.firestore.FieldValue;
 };
+
+/**
+ * Safely converts unknown input into a clean array of strings.
+ * - Trims whitespace
+ * - Removes empty values
+ * - Deduplicates (case-insensitive)
+ */
+function sanitizeStringArray(raw: any): string[] {
+  if (!Array.isArray(raw)) return [];
+  const cleaned = raw
+    .map((v) => String(v ?? "").trim())
+    .filter((v) => v.length > 0);
+
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const v of cleaned) {
+    const key = v.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(v);
+    }
+  }
+  return deduped;
+}
 
 function parsePinnedLocation(raw: any): Geo | null {
   if (!raw || typeof raw !== "object") return null;
@@ -92,6 +115,7 @@ async function geocodeAddress(
   try {
     let data = await callNominatim(query);
 
+    // If no results, try removing house number from the beginning as a fallback
     if (!data.length) {
       const fallback = query
         .replace(/^\s*(no\.?\s*)?\d+[a-zA-Z0-9\/-]*\s*,\s*/i, "")
@@ -130,6 +154,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const FieldValue = admin.firestore.FieldValue;
 
   try {
+    // -----------------------------
+    // 1) Verify contractor identity
+    // -----------------------------
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: "Missing auth token" });
@@ -144,6 +171,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(403).json({ error: "Only contractors can create provider accounts." });
     }
 
+    // -----------------------------
+    // 2) Read request body
+    // -----------------------------
     const {
       email = "",
       password = "",
@@ -153,7 +183,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       address = "",
       languages = [],
       skills = [],
-      location = null, // ✅ {lat,lng} from pick pin
+      // OPTIONAL: if you ever decide to send these from client
+      categories = [],
+      categoriesNormalized = [],
+      location = null, // ✅ {lat,lng} from pinned map
     } = req.body || {};
 
     const mail = String(email).trim().toLowerCase();
@@ -178,6 +211,37 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       });
     }
 
+    // ---------------------------------------------------------
+    // 3) IMPORTANT: Fetch provider subdoc to get categories fields
+    //    This is the most reliable source in Option A, because
+    //    Flutter already saved categories into contractors/{uid}/providers/{docId}
+    // ---------------------------------------------------------
+    const contractorProviderRef = admin
+      .firestore()
+      .collection("contractors")
+      .doc(callerUid)
+      .collection("providers")
+      .doc(providerId);
+
+    const contractorProviderSnap = await contractorProviderRef.get();
+    const contractorProviderData = contractorProviderSnap.exists
+      ? (contractorProviderSnap.data() as Record<string, any>)
+      : {};
+
+    // Prefer Firestore values (source of truth), fallback to body (optional)
+    const finalCategories =
+      sanitizeStringArray(contractorProviderData?.categories).length > 0
+        ? sanitizeStringArray(contractorProviderData?.categories)
+        : sanitizeStringArray(categories);
+
+    const finalCategoriesNormalized =
+      sanitizeStringArray(contractorProviderData?.categoriesNormalized).length > 0
+        ? sanitizeStringArray(contractorProviderData?.categoriesNormalized)
+        : sanitizeStringArray(categoriesNormalized);
+
+    // -----------------------------
+    // 4) Create Auth user
+    // -----------------------------
     const userRecord = await admin.auth().createUser({
       email: mail,
       password: pw,
@@ -186,6 +250,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const providerUid = userRecord.uid;
 
+    // -----------------------------
+    // 5) Create/merge users/{providerUid}
+    // -----------------------------
     await admin.firestore().collection("users").doc(providerUid).set(
       {
         role: "provider",
@@ -201,7 +268,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const contractorRef = admin.firestore().doc(`contractors/${callerUid}`);
     const userRef = admin.firestore().doc(`users/${providerUid}`);
 
-    // ✅ Priority: pin -> nominatim -> none
+    // -----------------------------
+    // 6) Determine GeoPoint (pin > nominatim > none)
+    // -----------------------------
     const pinned = parsePinnedLocation(location);
 
     let geo: Geo | null = null;
@@ -242,30 +311,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
-    // 1) contractor subdoc
-    await admin
-      .firestore()
-      .collection("contractors")
-      .doc(callerUid)
-      .collection("providers")
-      .doc(providerId)
-      .set(
-        {
-          providerUid,
-          email: mail,
-          firstName: fName,
-          lastName: lName,
-          address: fullAddress || "",
-          languages: langs,
-          skills: sks,
-          managedBy: contractorRef,
-          updatedAt: FieldValue.serverTimestamp(),
-          ...geoFields,
-        },
-        { merge: true },
-      );
+    // -----------------------------
+    // 7) Update contractor subdoc (ensure providerUid + geo + categories are present)
+    //    NOTE: merge:true ensures we do NOT wipe existing fields.
+    // -----------------------------
+    await contractorProviderRef.set(
+      {
+        providerUid,
+        email: mail,
+        firstName: fName,
+        lastName: lName,
+        address: fullAddress || "",
+        languages: langs,
+        skills: sks,
+        managedBy: contractorRef,
+        updatedAt: FieldValue.serverTimestamp(),
 
-    // 2) mirror into serviceProviders/{providerUid}
+        // ✅ Ensure categories are present
+        categories: finalCategories,
+        categoriesNormalized: finalCategoriesNormalized,
+
+        ...geoFields,
+      },
+      { merge: true },
+    );
+
+    // -----------------------------
+    // 8) Mirror into serviceProviders/{providerUid}
+    //    This is what Matching will read.
+    // -----------------------------
     await admin.firestore().collection("serviceProviders").doc(providerUid).set(
       {
         providerUid,
@@ -282,12 +356,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         lastName: lName,
         languages: langs,
 
+        // ✅ Mirror categories properly
+        categories: finalCategories,
+        categoriesNormalized: finalCategoriesNormalized,
+
         ...geoFields,
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
 
+    // -----------------------------
+    // 9) Send credentials email
+    // -----------------------------
     const subject = "Your FixIt provider account";
     const text =
       `Hi ${fName || ""},\n\n` +
@@ -300,7 +381,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     await sendEmail(mail, subject, text);
 
-    return res.status(200).json({ ok: true, providerUid, geo, version: "svcProviders-v3-pin" });
+    return res.status(200).json({
+      ok: true,
+      providerUid,
+      geo,
+      categories: finalCategories,
+      categoriesNormalized: finalCategoriesNormalized,
+      version: "svcProviders-v4-categories-mirror",
+    });
   } catch (err: any) {
     console.error("create-provider-account error:", err);
 
