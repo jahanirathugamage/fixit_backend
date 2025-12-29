@@ -1,4 +1,7 @@
 // pages/api/match-providers.ts
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 
@@ -142,7 +145,6 @@ async function providerHasOverlap(
   return false;
 }
 
-
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<ApiError | any>,
@@ -240,26 +242,26 @@ export default async function handler(
     }
 
     const jobLocationJson = {
-    lat: jobLocation.latitude,
-    lng: jobLocation.longitude,
-  };
+      lat: jobLocation.latitude,
+      lng: jobLocation.longitude,
+    };
 
     return res.status(200).json({
-    ok: true,
-    jobId: jobRequestId,
+      ok: true,
+      jobId: jobRequestId,
 
-    jobLocation: jobLocationJson,
+      jobLocation: jobLocationJson,
 
-    startAt: startAt.toDate().toISOString(),
-    endAt: endAt.toDate().toISOString(),
-    blockStartAt: blockStartAt.toDate().toISOString(),
-    blockEndAt: blockEndAt.toDate().toISOString(),
+      startAt: startAt.toDate().toISOString(),
+      endAt: endAt.toDate().toISOString(),
+      blockStartAt: blockStartAt.toDate().toISOString(),
+      blockEndAt: blockEndAt.toDate().toISOString(),
 
-    totalDurationMins,
-    bufferBeforeMins,
-    bufferAfterMins,
+      totalDurationMins,
+      bufferBeforeMins,
+      bufferAfterMins,
 
-    providers: availableProviders,
+      providers: availableProviders,
     });
   } catch (err: unknown) {
     const e = err as { code?: string; message?: string };
