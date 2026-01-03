@@ -67,15 +67,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       (contractorData.companyName as string | undefined) || "your firm";
 
     await contractorRef.set(
-      {
-        approvalStatus: "approved",
-        approvalNote: cleanNote,
-        rejectionReason: admin.firestore.FieldValue.delete(),
-        approvedAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
+    {
+      approvalStatus: "approved",
+
+      // ✅ add these for compatibility with your existing Flutter queries
+      verified: true,
+      status: "approved",
+      verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+
+      approvalNote: cleanNote,
+      rejectionReason: admin.firestore.FieldValue.delete(),
+      approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+
 
     await admin.firestore().collection("users").doc(contractorUid).set(
       {
