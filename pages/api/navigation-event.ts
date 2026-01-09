@@ -171,7 +171,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         await sendToUserTopic({
           userUid: clientId,
           title: "On the way",
-          body: `${providerName} is on the way to your location.`,
+          body: `${providerName} is on the way to your job.`,
           data: { jobId, type: "on_the_way" },
         });
 
