@@ -2,7 +2,6 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 
@@ -91,6 +90,13 @@ function computeTotalDurationMinutes(
   return total;
 }
 
+/**
+ * Availability check with ONLY ONE inequality in Firestore query.
+ * We query:
+ *   where("blockStartAt", "<", requestedBlockEnd)
+ * Then we filter overlap (blockEndAt > requestedBlockStart) in code.
+ * Also ignores expired holds.
+ */
 async function providerHasOverlap(
   providerUid: string,
   requestedBlockStart: admin.firestore.Timestamp,
@@ -99,7 +105,6 @@ async function providerHasOverlap(
   const db = admin.firestore();
   const now = admin.firestore.Timestamp.now();
 
-  // ✅ Only ONE inequality in the query (no composite index required)
   const blocksSnap = await db
     .collection("serviceProviders")
     .doc(providerUid)
@@ -125,7 +130,7 @@ async function providerHasOverlap(
       }
     }
 
-    // ✅ Second overlap check in code (not Firestore query)
+    // Overlap check in code
     const overlaps =
       blockStartAt.toMillis() < requestedBlockEnd.toMillis() &&
       blockEndAt.toMillis() > requestedBlockStart.toMillis();
@@ -136,7 +141,6 @@ async function providerHasOverlap(
   return false;
 }
 
-
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<ApiError | any>,
@@ -144,19 +148,26 @@ export default async function handler(
   setCors(res);
 
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST")
+    return res.status(405).json({ error: "Method not allowed" });
 
   try {
     // 1) Auth client
     const authHeader = req.headers.authorization || "";
-    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    const idToken = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : null;
     if (!idToken) return res.status(401).json({ error: "Missing auth token" });
 
     const decoded = await admin.auth().verifyIdToken(idToken);
     const callerUid = decoded.uid;
 
     const role = await getCallerRole(callerUid);
-    if (role !== "client") return res.status(403).json({ error: "Only clients can hold providers." });
+    if (role !== "client") {
+      return res
+        .status(403)
+        .json({ error: "Only clients can hold providers." });
+    }
 
     // 2) Body
     const { jobId = "", providerUid = "" } = req.body || {};
@@ -171,7 +182,9 @@ export default async function handler(
     // 3) Load jobRequest
     const jobRef = db.collection("jobRequest").doc(jobRequestId);
     const jobSnap = await jobRef.get();
-    if (!jobSnap.exists) return res.status(404).json({ error: "Job request not found." });
+    if (!jobSnap.exists) {
+      return res.status(404).json({ error: "Job request not found." });
+    }
 
     const job = jobSnap.data() as any;
 
@@ -179,11 +192,19 @@ export default async function handler(
     const isNow = Boolean(job.isNow);
     const scheduledDate = job.scheduledDate as admin.firestore.Timestamp | undefined;
 
-    const category = normalizeCategory(job.category);
-    if (!category) return res.status(400).json({ error: "Job request missing category." });
+    const category = normalizeCategory(job.categoryNormalized ?? job.category);
+    if (!category) {
+      return res
+        .status(400)
+        .json({ error: "Job request missing category/categoryNormalized." });
+    }
 
     const jobLocation = job.location as admin.firestore.GeoPoint | undefined;
-    if (!jobLocation) return res.status(400).json({ error: "Job request missing location GeoPoint." });
+    if (!jobLocation) {
+      return res
+        .status(400)
+        .json({ error: "Job request missing location GeoPoint." });
+    }
 
     const tasks = Array.isArray(job.tasks) ? job.tasks : [];
 
@@ -192,7 +213,10 @@ export default async function handler(
       ? admin.firestore.Timestamp.now()
       : scheduledDate ?? admin.firestore.Timestamp.now();
 
-    const labels = tasks.map((t: any) => String(t?.label ?? "").trim()).filter(isNonEmptyString);
+    const labels = tasks
+      .map((t: any) => String(t?.label ?? "").trim())
+      .filter(isNonEmptyString);
+
     const durationsByLabel = await fetchDurationsByLabels(labels);
     const totalDurationMins = computeTotalDurationMinutes(tasks, durationsByLabel);
 
@@ -208,12 +232,13 @@ export default async function handler(
     if (hasOverlap) {
       return res.status(409).json({
         error: "Provider unavailable",
-        message: "This provider has an overlapping booking/hold. Please select another provider.",
+        message:
+          "This provider has an overlapping booking/hold. Please select another provider.",
       });
     }
 
     // 6) Create hold
-    const holdMinutes = 10; // you can change this
+    const holdMinutes = 10; // change if needed
     const now = admin.firestore.Timestamp.now();
     const holdExpiresAt = addMinutes(now, holdMinutes);
 
@@ -223,6 +248,7 @@ export default async function handler(
       .collection("timeBlocks")
       .doc(); // auto id
 
+    // Use serverTimestamp for createdAt (and keep a deterministic now field too if you want)
     await holdRef.set({
       status: "held",
       jobId: jobRequestId,
@@ -237,13 +263,15 @@ export default async function handler(
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // 7) Save selection onto jobRequest (nice for tracking)
+    // 7) Save selection onto jobRequest so PROVIDER can see it
+    // Important: use selectedProviderUid (this is what your rules + provider screens should use)
+    // Also set a consistent request status the provider screen can query.
     await jobRef.set(
       {
         selectedProviderUid: pUid,
         holdId: holdRef.id,
         holdExpiresAt,
-        status: "holding",
+        status: "requested", // ✅ better than "holding" for provider flow
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true },
@@ -256,13 +284,14 @@ export default async function handler(
       holdId: holdRef.id,
       holdExpiresAt: holdExpiresAt.toDate().toISOString(),
       holdMinutes,
+      status: "requested",
     });
   } catch (err: any) {
     console.error("hold-provider error:", err);
     return res.status(500).json({
       error: "Failed to hold provider.",
-      code: err.code,
-      message: err.message,
+      code: err?.code,
+      message: err?.message,
     });
   }
 }

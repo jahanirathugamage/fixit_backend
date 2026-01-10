@@ -1,4 +1,8 @@
 // pages/api/match-providers.ts
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 
@@ -261,13 +265,12 @@ export default async function handler(
 
     providers: availableProviders,
     });
-  } catch (err: unknown) {
-    const e = err as { code?: string; message?: string };
-    console.error("match-providers error:", e);
+  } catch (err: any) {
+    console.error("match-providers error:", err);
     return res.status(500).json({
       error: "Failed to match providers.",
-      code: e.code,
-      message: e.message,
+      code: err?.code,
+      message: err?.message,
     });
   }
 }
