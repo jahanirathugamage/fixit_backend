@@ -50,6 +50,34 @@ async function sendToUserTopic(params: {
   });
 }
 
+/**
+ * ✅ Atomic lock to prevent duplicate sends in race conditions.
+ * - If the doc already exists => lock NOT acquired => do not send again
+ * - If acquired but send fails => we delete the lock so it can retry later
+ */
+async function acquireNotifLock(lockId: string): Promise<boolean> {
+  const ref = admin.firestore().collection("navNotificationLocks").doc(lockId);
+  try {
+    await ref.create({
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return true;
+  } catch (e: unknown) {
+    // Firestore "already exists" -> lock not acquired
+    // Admin SDK error codes differ slightly by runtime, so keep it simple
+    return false;
+  }
+}
+
+async function releaseNotifLock(lockId: string): Promise<void> {
+  const ref = admin.firestore().collection("navNotificationLocks").doc(lockId);
+  try {
+    await ref.delete();
+  } catch {
+    // ignore
+  }
+}
+
 type NavEventBody = {
   jobId?: unknown;
   type?: unknown;
@@ -98,7 +126,8 @@ function getErrorMessage(e: unknown): string {
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST")
+    return res.status(405).json({ error: "Method not allowed" });
 
   try {
     // ---- AUTH ----
@@ -137,7 +166,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const clientId = asString(rawJob.clientId).trim();
 
     if (!selectedProviderUid || !clientId) {
-      return res.status(400).json({ error: "Job missing selectedProviderUid/clientId" });
+      return res
+        .status(400)
+        .json({ error: "Job missing selectedProviderUid/clientId" });
     }
 
     // Provider must be the assigned provider
@@ -145,11 +176,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(403).json({ error: "Not allowed (not selected provider)" });
     }
 
-    const providerName = asString(
-      rawJob.providerName ?? rawJob.selectedProviderName ?? rawJob.serviceProviderName ?? "Your service provider"
-    ).trim() || "Your service provider";
+    const providerName =
+      asString(
+        rawJob.providerName ??
+          rawJob.selectedProviderName ??
+          rawJob.serviceProviderName ??
+          "Your service provider"
+      ).trim() || "Your service provider";
 
-    const notif = (rawJob.navigationNotifications ?? {}) as NonNullable<JobRequestDoc["navigationNotifications"]>;
+    const notif =
+      (rawJob.navigationNotifications ?? {}) as NonNullable<
+        JobRequestDoc["navigationNotifications"]
+      >;
 
     const updates: FirestoreUpdate = {
       "navigation.lastEventAt": admin.firestore.FieldValue.serverTimestamp(),
@@ -165,7 +203,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       updates["navigation.lastLocationAt"] = admin.firestore.FieldValue.serverTimestamp();
     }
 
-    // ---- NAV_STARTED => send "On the way" once ----
+    // ---- NAV_STARTED => send "On the way" once (existing flag is OK here) ----
     if (type === "NAV_STARTED") {
       if (!notif.onTheWaySentAt) {
         await sendToUserTopic({
@@ -182,22 +220,32 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     // ---- NAV_UPDATE => check ETA(<=10min) and Arrived (distance) ----
     if (type === "NAV_UPDATE") {
-      // 10-min notification (based on ETA seconds from provider app)
+      // ✅ 10-min notification ONCE (race-safe)
       if (isFiniteNumber(etaSeconds) && etaSeconds <= 600 && !notif.tenMinSentAt) {
-        await sendToUserTopic({
-          userUid: clientId,
-          title: "Almost there",
-          body: `${providerName} is about 10 minutes away.`,
-          data: { jobId, type: "ten_min" },
-        });
+        const lockId = `${jobId}_ten_min`;
 
-        updates["navigationNotifications.tenMinSentAt"] =
-          admin.firestore.FieldValue.serverTimestamp();
+        const locked = await acquireNotifLock(lockId);
+        if (locked) {
+          try {
+            await sendToUserTopic({
+              userUid: clientId,
+              title: "Almost there",
+              body: `${providerName} is about 10 minutes away.`,
+              data: { jobId, type: "ten_min" },
+            });
+
+            updates["navigationNotifications.tenMinSentAt"] =
+              admin.firestore.FieldValue.serverTimestamp();
+          } catch (e) {
+            // allow retry later if send failed
+            await releaseNotifLock(lockId);
+            throw e;
+          }
+        }
       }
 
-      // Arrived detection (based on distance to job location if job has GeoPoint-like object)
+      // ✅ Arrived notification ONCE (race-safe)
       const jobLoc = rawJob.location;
-
       const jobLat = jobLoc && isRecord(jobLoc) ? jobLoc.latitude : undefined;
       const jobLng = jobLoc && isRecord(jobLoc) ? jobLoc.longitude : undefined;
 
@@ -208,24 +256,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         isFiniteNumber(jobLng) &&
         !notif.arrivedSentAt
       ) {
-        const dist = haversineMeters(
-          { lat, lng },
-          { lat: jobLat, lng: jobLng }
-        );
+        const dist = haversineMeters({ lat, lng }, { lat: jobLat, lng: jobLng });
 
-        // You can tune this threshold
         const ARRIVE_THRESHOLD_METERS = 120;
 
         if (dist <= ARRIVE_THRESHOLD_METERS) {
-          await sendToUserTopic({
-            userUid: clientId,
-            title: "Arrived",
-            body: `${providerName} has arrived.`,
-            data: { jobId, type: "arrived" },
-          });
+          const lockId = `${jobId}_arrived`;
 
-          updates["navigationNotifications.arrivedSentAt"] =
-            admin.firestore.FieldValue.serverTimestamp();
+          const locked = await acquireNotifLock(lockId);
+          if (locked) {
+            try {
+              await sendToUserTopic({
+                userUid: clientId,
+                title: "Arrived",
+                body: `${providerName} has arrived.`,
+                data: { jobId, type: "arrived" },
+              });
+
+              updates["navigationNotifications.arrivedSentAt"] =
+                admin.firestore.FieldValue.serverTimestamp();
+            } catch (e) {
+              await releaseNotifLock(lockId);
+              throw e;
+            }
+          }
         }
       }
     }
