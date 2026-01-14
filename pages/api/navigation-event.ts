@@ -10,10 +10,7 @@ function setCors(res: NextApiResponse) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
-function haversineMeters(
-  a: { lat: number; lng: number },
-  b: { lat: number; lng: number }
-) {
+function haversineMeters(a: { lat: number; lng: number }, b: { lat: number; lng: number }) {
   const R = 6371000; // meters
   const toRad = (x: number) => (x * Math.PI) / 180;
 
@@ -62,9 +59,8 @@ async function acquireNotifLock(lockId: string): Promise<boolean> {
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     return true;
-  } catch (e: unknown) {
-    // Firestore "already exists" -> lock not acquired
-    // Admin SDK error codes differ slightly by runtime, so keep it simple
+  } catch {
+    // Firestore "already exists" or other create failure -> treat as not acquired
     return false;
   }
 }
@@ -126,8 +122,7 @@ function getErrorMessage(e: unknown): string {
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST")
-    return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
     // ---- AUTH ----
@@ -166,9 +161,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const clientId = asString(rawJob.clientId).trim();
 
     if (!selectedProviderUid || !clientId) {
-      return res
-        .status(400)
-        .json({ error: "Job missing selectedProviderUid/clientId" });
+      return res.status(400).json({ error: "Job missing selectedProviderUid/clientId" });
     }
 
     // Provider must be the assigned provider
@@ -185,9 +178,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       ).trim() || "Your service provider";
 
     const notif =
-      (rawJob.navigationNotifications ?? {}) as NonNullable<
-        JobRequestDoc["navigationNotifications"]
-      >;
+      (rawJob.navigationNotifications ?? {}) as NonNullable<JobRequestDoc["navigationNotifications"]>;
 
     const updates: FirestoreUpdate = {
       "navigation.lastEventAt": admin.firestore.FieldValue.serverTimestamp(),
@@ -203,7 +194,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       updates["navigation.lastLocationAt"] = admin.firestore.FieldValue.serverTimestamp();
     }
 
-    // ---- NAV_STARTED => send "On the way" once (existing flag is OK here) ----
+    // ---- NAV_STARTED => send "On the way" once ----
     if (type === "NAV_STARTED") {
       if (!notif.onTheWaySentAt) {
         await sendToUserTopic({
@@ -236,10 +227,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
             updates["navigationNotifications.tenMinSentAt"] =
               admin.firestore.FieldValue.serverTimestamp();
-          } catch (e) {
-            // allow retry later if send failed
+          } catch (err: unknown) {
             await releaseNotifLock(lockId);
-            throw e;
+            throw err;
           }
         }
       }
@@ -275,9 +265,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
               updates["navigationNotifications.arrivedSentAt"] =
                 admin.firestore.FieldValue.serverTimestamp();
-            } catch (e) {
+            } catch (err: unknown) {
               await releaseNotifLock(lockId);
-              throw e;
+              throw err;
             }
           }
         }

@@ -88,6 +88,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       {
         status,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        // Your Flutter + rules currently allow providerResponseAt (and we also allow providerDecisionAt in rules)
         providerResponseAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
@@ -98,12 +99,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       asString(job["providerName"] ?? job["selectedProviderName"] ?? job["serviceProviderName"]).trim() ||
       "Your service provider";
 
+    // IMPORTANT:
+    // Your Flutter NotificationRouter routes based on `data.type` (not `data.route`).
+    // We send BOTH to be backward-compatible with any older handler you might still have.
     if (status === "accepted") {
       await sendToUserTopic({
         userUid: clientId,
         title: "Job Accepted",
         body: `${providerName} accepted your job request.`,
         data: {
+          type: "client_job_accepted",
           route: "/dashboards/client/client_jobs",
           jobId,
           click_action: "FLUTTER_NOTIFICATION_CLICK",
@@ -115,6 +120,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         title: "Job Declined",
         body: `${providerName} declined your job request.`,
         data: {
+          type: "client_job_declined",
           route: "/dashboards/client/client_job_requests",
           jobId,
           click_action: "FLUTTER_NOTIFICATION_CLICK",
