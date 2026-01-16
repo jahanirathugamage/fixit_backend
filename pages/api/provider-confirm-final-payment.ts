@@ -21,9 +21,7 @@ function getErrorMessage(e: unknown): string {
   return String(e);
 }
 
-type Body = {
-  jobId?: unknown;
-};
+type Body = { jobId?: unknown };
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   setCors(res);
@@ -45,74 +43,102 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!jobId) return res.status(400).json({ error: "jobId is required" });
 
     const db = admin.firestore();
-
-    // ---- LOAD JOB ----
     const jobRef = db.collection("jobRequest").doc(jobId);
-    const snap = await jobRef.get();
-    if (!snap.exists) return res.status(404).json({ error: "Job not found" });
 
-    const job = snap.data() ?? {};
-    const providerUid = asString(job["selectedProviderUid"]).trim();
-    const clientId = asString(job["clientId"]).trim();
-    const status = asString(job["status"]).trim().toLowerCase();
+    const paymentDocId = `${jobId}_final_payment`;
+    const paymentRef = db.collection("payments").doc(paymentDocId);
 
-    if (!providerUid || !clientId) {
-      return res.status(400).json({ error: "Job missing selectedProviderUid/clientId" });
-    }
+    const result = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(jobRef);
+      if (!snap.exists) return { code: 404 as const, payload: { error: "Job not found" } };
 
-    // Caller must be assigned provider
-    if (providerUid !== callerUid) {
-      return res.status(403).json({ error: "Not allowed (not selected provider)" });
-    }
+      const job = snap.data() ?? {};
+      const providerUid = asString(job["selectedProviderUid"]).trim();
+      const clientId = asString(job["clientId"]).trim();
+      const status = asString(job["status"]).trim().toLowerCase();
 
-    // Optional: enforce correct state
-    // Client marks invoice paid -> "completed_pending_payment" in your client-mark-invoice-paid.ts
-    if (status && status !== "completed_pending_payment") {
-      return res.status(400).json({ error: "Job is not awaiting final payment confirmation" });
-    }
+      if (!providerUid || !clientId) {
+        return { code: 400 as const, payload: { error: "Job missing selectedProviderUid/clientId" } };
+      }
+      if (providerUid !== callerUid) {
+        return { code: 403 as const, payload: { error: "Not allowed (not selected provider)" } };
+      }
 
-    const now = admin.firestore.FieldValue.serverTimestamp();
+      // ✅ Idempotent: if already completed/confirmed, return ok
+      const alreadyConfirmed = !!job["finalPaymentConfirmedAt"] || status === "completed_hidden";
+      if (alreadyConfirmed) {
+        return { code: 200 as const, payload: { ok: true, paymentId: paymentDocId, idempotent: true } };
+      }
 
-    // ---- UPDATE JOB (completed + hidden) ----
-    await jobRef.set(
-      {
-        status: "completed_hidden",
-        finalPaymentConfirmedAt: now,
-        updatedAt: now,
-      },
-      { merge: true }
-    );
+      // Client-mark-invoice-paid sets: completed_pending_payment
+      if (status && status !== "completed_pending_payment") {
+        return { code: 400 as const, payload: { error: "Job is not awaiting final payment confirmation" } };
+      }
 
-    // ---- PAYMENT RECORD ----
-    await db.collection("payments").add({
-      type: "final_payment",
-      status: "paid_confirmed",
-      currency: "LKR",
-      jobRequestId: jobId,
-      clientId,
-      providerUid,
-      confirmedByProviderAt: now,
-      createdAt: now,
-      updatedAt: now,
+      const now = admin.firestore.FieldValue.serverTimestamp();
+
+      // ✅ Update job
+      tx.set(
+        jobRef,
+        {
+          status: "completed_hidden",
+          finalPaymentConfirmedAt: now,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+
+      // ✅ Deterministic payment doc (prevents duplicates)
+      tx.set(
+        paymentRef,
+        {
+          type: "final_payment",
+          status: "paid_confirmed",
+          currency: "LKR",
+
+          jobRequestId: jobId,
+          clientId,
+          providerUid,
+
+          confirmedByProviderAt: now,
+          createdAt: now,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+
+      return { code: 200 as const, payload: { ok: true, paymentId: paymentDocId } };
     });
 
-    // Optional: notify client that job is completed (safe to keep minimal)
-    await admin.messaging().send({
-      topic: `user_${clientId}`,
-      notification: {
-        title: "Job Completed",
-        body: "Thank you for using FixIt, we are happy to serve you.",
-      },
-      data: {
-        type: "client_job_completed",
-        route: "/dashboards/client/client_jobs",
-        jobId,
-        click_action: "FLUTTER_NOTIFICATION_CLICK",
-      },
-      android: { priority: "high" },
-    });
+    if (result.code !== 200) return res.status(result.code).json(result.payload);
 
-    return res.status(200).json({ ok: true });
+    // Notify client (optional)
+    try {
+      const snap = await jobRef.get();
+      const job = snap.data() ?? {};
+      const clientId = asString(job["clientId"]).trim();
+
+      if (clientId) {
+        await admin.messaging().send({
+          topic: `user_${clientId}`,
+          notification: {
+            title: "Job Completed",
+            body: "Thank you for using FixIt, we are happy to serve you.",
+          },
+          data: {
+            type: "client_job_completed",
+            route: "/dashboards/client/client_jobs",
+            jobId,
+            click_action: "FLUTTER_NOTIFICATION_CLICK",
+          },
+          android: { priority: "high" },
+        });
+      }
+    } catch {
+      // ignore notification failures
+    }
+
+    return res.status(200).json(result.payload);
   } catch (e: unknown) {
     return res.status(500).json({ error: getErrorMessage(e) });
   }
