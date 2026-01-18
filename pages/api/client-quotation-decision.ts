@@ -83,6 +83,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(400).json({ error: "decision must be accepted|declined" });
     }
 
+    // ✅ IMPORTANT: only allow decline if client confirmed payment in UI
+    if (decision === "declined" && !clientVisitationConfirmed) {
+      return res.status(400).json({
+        error: "clientVisitationConfirmed must be true when declining quotation",
+      });
+    }
+
     const db = admin.firestore();
 
     const jobRef = db.collection("jobRequest").doc(jobId);
@@ -101,46 +108,67 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(403).json({ error: "Not allowed (not job client)" });
     }
 
-    // ---- Load latest quotation (for quotationId + contractorId + pricing/tasks sync) ----
+    // ---- Load quotation reliably (NO composite index required) ----
     let contractorId = "";
-    let quotationId = asString(job["quotationId"]).trim(); // jobRequest already stores it sometimes (your screenshot)
+    let quotationId = asString(job["quotationId"]).trim();
 
     let qPricing: Record<string, unknown> | null = null;
     let qTasks: unknown[] | null = null;
 
-    try {
-      const qSnap = await db
-        .collection("quotations")
-        .where("jobId", "==", jobId)
-        .orderBy("createdAt", "desc")
-        .limit(1)
-        .get();
+    // 1) If job has quotationId, fetch directly (best + no index)
+    if (quotationId) {
+      try {
+        const qDoc = await db.collection("quotations").doc(quotationId).get();
+        if (qDoc.exists) {
+          const qData = qDoc.data() ?? {};
+          contractorId = asString(qData["contractorId"]).trim();
 
-      if (!qSnap.empty) {
-        const qDoc = qSnap.docs[0];
-        quotationId = quotationId || qDoc.id;
-        const qData = qDoc.data() ?? {};
-        contractorId = asString(qData["contractorId"]).trim();
+          const pricingMaybe = qData["pricing"];
+          if (pricingMaybe && typeof pricingMaybe === "object") {
+            qPricing = pricingMaybe as Record<string, unknown>;
+          }
 
-        const pricingMaybe = qData["pricing"];
-        if (pricingMaybe && typeof pricingMaybe === "object") {
-          qPricing = pricingMaybe as Record<string, unknown>;
+          const tasksMaybe = qData["tasks"];
+          if (Array.isArray(tasksMaybe)) {
+            qTasks = tasksMaybe as unknown[];
+          }
         }
-
-        const tasksMaybe = qData["tasks"];
-        if (Array.isArray(tasksMaybe)) {
-          qTasks = tasksMaybe as unknown[];
-        }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
+    }
+
+    // 2) Fallback: query by jobId WITHOUT orderBy (no index)
+    if (!qTasks || !qPricing || !contractorId || !quotationId) {
+      try {
+        const qSnap = await db.collection("quotations").where("jobId", "==", jobId).limit(1).get();
+
+        if (!qSnap.empty) {
+          const qDoc = qSnap.docs[0];
+          quotationId = quotationId || qDoc.id;
+
+          const qData = qDoc.data() ?? {};
+          contractorId = contractorId || asString(qData["contractorId"]).trim();
+
+          const pricingMaybe = qData["pricing"];
+          if (!qPricing && pricingMaybe && typeof pricingMaybe === "object") {
+            qPricing = pricingMaybe as Record<string, unknown>;
+          }
+
+          const tasksMaybe = qData["tasks"];
+          if (!qTasks && Array.isArray(tasksMaybe)) {
+            qTasks = tasksMaybe as unknown[];
+          }
+        }
+      } catch {
+        // ignore
+      }
     }
 
     const now = admin.firestore.FieldValue.serverTimestamp();
 
     // ---- ACCEPTED ----
     if (decision === "accepted") {
-      // Sync job tasks/pricing with quotation so client/provider/admin see quotation-updated version
       const patch: Record<string, unknown> = {
         status: "quotation_accepted",
         quotationDecision: "accepted",
@@ -151,7 +179,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       if (quotationId) patch["quotationId"] = quotationId;
       if (contractorId) patch["contractorId"] = contractorId;
 
-      // Copy quotation fields if available
+      // ✅ IMPORTANT: replace job tasks with quotation tasks (new truth)
       if (qPricing) patch["pricing"] = qPricing;
       if (qTasks) patch["tasks"] = qTasks;
 
@@ -194,27 +222,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     // ---- DECLINED ----
-    // Your Firestore screenshot expects:
-    // status: "quotation_declined_pending_visitation"
-    // and jobRequest has quotationId.
-
-    // Determine visitation fee amount for payment schema
-    const jobPricing = (job["pricing"] && typeof job["pricing"] === "object" ? (job["pricing"] as Record<string, unknown>) : {}) as Record<
-      string,
-      unknown
-    >;
+    const jobPricing =
+      (job["pricing"] && typeof job["pricing"] === "object"
+        ? (job["pricing"] as Record<string, unknown>)
+        : {}) as Record<string, unknown>;
 
     const fromJob = asInt(jobPricing["visitationFee"] ?? job["visitationFeeLkr"]);
     const fromQuotation = qPricing ? asInt(qPricing["visitationFee"]) : 0;
     const visitationFee = fromQuotation > 0 ? fromQuotation : fromJob;
 
-    // Payment doc: we create/merge a deterministic "pending" record now.
-    // Provider confirmation endpoint can finalize it later (set providerConfirmedAt + status=finalized).
     const paymentId = quotationId ? `visitation_${jobId}_${quotationId}` : `visitation_${jobId}`;
     const paymentRef = db.collection("payments").doc(paymentId);
 
     await db.runTransaction(async (tx) => {
-      // 1) update job
       tx.set(
         jobRef,
         {
@@ -226,14 +246,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           ...(quotationId ? { quotationId } : {}),
           ...(contractorId ? { contractorId } : {}),
 
-          // client-side confirmation stamp
-          clientVisitationConfirmed: true,
+          // ✅ use the actual boolean passed from the client sheet
+          clientVisitationConfirmed,
           clientVisitationConfirmedAt: now,
         },
         { merge: true }
       );
 
-      // 2) upsert payment (pending provider confirmation)
       tx.set(
         paymentRef,
         {
@@ -261,7 +280,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       );
     });
 
-    // Notify provider to confirm visitation fee (opens job details; UI auto shows sheet)
     try {
       await sendToUserTopic({
         userUid: providerUid,
@@ -277,7 +295,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       });
     } catch {}
 
-    // Notify contractor (best-effort)
     if (contractorId) {
       try {
         await sendToUserTopic({
