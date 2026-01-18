@@ -1,4 +1,3 @@
-// pages/api/client-mark-invoice-paid.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 
@@ -6,6 +5,10 @@ function setCors(res: NextApiResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
 }
 
 function asString(v: unknown): string {
@@ -16,6 +19,22 @@ function getErrorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
 }
+
+async function sendToUserTopic(params: {
+  userUid: string;
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+}) {
+  await admin.messaging().send({
+    topic: `user_${params.userUid}`,
+    notification: { title: params.title, body: params.body },
+    data: params.data ?? {},
+    android: { priority: "high" },
+  });
+}
+
+type Body = { jobId?: unknown };
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   setCors(res);
@@ -30,11 +49,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const decoded = await admin.auth().verifyIdToken(match[1]);
     const callerUid = decoded.uid;
 
-    const jobId = asString((req.body as { jobId?: unknown } | undefined)?.jobId).trim();
+    const body: Body = isRecord(req.body) ? (req.body as Body) : {};
+    const jobId = asString(body.jobId).trim();
     if (!jobId) return res.status(400).json({ error: "jobId is required" });
 
     const db = admin.firestore();
-
     const jobRef = db.collection("jobRequest").doc(jobId);
     const snap = await jobRef.get();
     if (!snap.exists) return res.status(404).json({ error: "Job not found" });
@@ -42,52 +61,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const job = snap.data() ?? {};
     const clientId = asString(job["clientId"]).trim();
     const providerUid = asString(job["selectedProviderUid"]).trim();
-    const latestInvoiceId = asString(job["latestInvoiceId"]).trim();
 
     if (!clientId || !providerUid) {
-      return res.status(400).json({ error: "Job missing clientId/providerUid" });
+      return res.status(400).json({ error: "Job missing clientId/selectedProviderUid" });
     }
     if (clientId !== callerUid) {
       return res.status(403).json({ error: "Not allowed (not job client)" });
     }
 
-    // ✅ Move to the EXACT state your provider-side sheet expects
-    // Provider auto-confirm sheet triggers on: "awaiting_final_payment_confirmation"
+    // Client confirms they paid final → provider must confirm received
     await jobRef.set(
       {
         status: "awaiting_final_payment_confirmation",
-        invoicePaidAt: admin.firestore.FieldValue.serverTimestamp(),
+        clientFinalPaymentConfirmed: true,
+        clientFinalPaymentConfirmedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
-    // ✅ Optional: mark latest invoice doc too (useful for admin/audit)
-    if (latestInvoiceId) {
-      await db.collection("invoices").doc(latestInvoiceId).set(
-        {
-          status: "client_marked_paid",
-          paidAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-    }
-
-    // Notify provider to confirm payment received
-    await admin.messaging().send({
-      topic: `user_${providerUid}`,
-      notification: {
-        title: "Payment Received?",
-        body: "Client marked invoice as paid. Please confirm receipt.",
-      },
+    await sendToUserTopic({
+      userUid: providerUid,
+      title: "Confirm Payment",
+      body: "Client confirmed the final payment. Please confirm you received it.",
       data: {
-        type: "provider_confirm_final_payment",
-        route: "/provider/confirm_final_payment",
+        route: "/provider/job_details",
         jobId,
+        type: "final_payment_confirm_required",
         click_action: "FLUTTER_NOTIFICATION_CLICK",
       },
-      android: { priority: "high" },
     });
 
     return res.status(200).json({ ok: true });

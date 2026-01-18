@@ -16,12 +16,25 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
 
+function asNumber(v: unknown): number {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
 function getErrorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
 }
 
 type Body = { jobId?: unknown };
+
+type InvoicePricing = {
+  totalAmount?: unknown;
+};
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   setCors(res);
@@ -58,32 +71,82 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       const status = asString(job["status"]).trim().toLowerCase();
 
       if (!providerUid || !clientId) {
-        return { code: 400 as const, payload: { error: "Job missing selectedProviderUid/clientId" } };
+        return {
+          code: 400 as const,
+          payload: { error: "Job missing selectedProviderUid/clientId" },
+        };
       }
       if (providerUid !== callerUid) {
         return { code: 403 as const, payload: { error: "Not allowed (not selected provider)" } };
       }
 
-      // ✅ Idempotent: if already completed/confirmed, return ok
-      const alreadyConfirmed = !!job["finalPaymentConfirmedAt"] || status === "completed_hidden";
+      // ✅ Idempotent
+      const alreadyConfirmed = !!job["finalPaymentConfirmedAt"] || status === "completed";
       if (alreadyConfirmed) {
-        return { code: 200 as const, payload: { ok: true, paymentId: paymentDocId, idempotent: true } };
+        return {
+          code: 200 as const,
+          payload: { ok: true, paymentId: paymentDocId, idempotent: true },
+        };
       }
 
-      // Client-mark-invoice-paid sets: completed_pending_payment
-      if (status && status !== "completed_pending_payment") {
-        return { code: 400 as const, payload: { error: "Job is not awaiting final payment confirmation" } };
+      // ✅ Accept BOTH for backwards compatibility:
+      // - Old flow: completed_pending_payment
+      // - New flow: awaiting_final_payment_confirmation
+      const allowed =
+        status === "awaiting_final_payment_confirmation" || status === "completed_pending_payment";
+
+      if (!allowed) {
+        return {
+          code: 400 as const,
+          payload: { error: "Job is not awaiting final payment confirmation" },
+        };
       }
 
       const now = admin.firestore.FieldValue.serverTimestamp();
 
-      // ✅ Update job
+      // ✅ Find latest invoice for this job (if any) and mark it confirmed
+      const invoiceQuery = db
+        .collection("invoices")
+        .where("jobId", "==", jobId)
+        .orderBy("createdAt", "desc")
+        .limit(1);
+
+      const invoiceSnap = await tx.get(invoiceQuery);
+
+      let latestInvoiceId = "";
+      let finalAmount = 0;
+
+      if (!invoiceSnap.empty) {
+        const doc = invoiceSnap.docs[0];
+        latestInvoiceId = doc.id;
+
+        const inv = doc.data() ?? {};
+        const rawPricing = inv["pricing"];
+
+        let pricing: InvoicePricing = {};
+        if (isRecord(rawPricing)) pricing = rawPricing as InvoicePricing;
+
+        finalAmount = asNumber(pricing.totalAmount);
+
+        tx.set(
+          db.collection("invoices").doc(latestInvoiceId),
+          {
+            status: "paid_confirmed_by_provider",
+            providerConfirmedAt: now,
+            updatedAt: now,
+          },
+          { merge: true }
+        );
+      }
+
+      // ✅ Update job status to COMPLETED (do NOT hide it here)
       tx.set(
         jobRef,
         {
-          status: "completed_hidden",
+          status: "completed",
           finalPaymentConfirmedAt: now,
           updatedAt: now,
+          latestInvoiceId: latestInvoiceId || asString(job["latestInvoiceId"]).trim(),
         },
         { merge: true }
       );
@@ -100,6 +163,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           clientId,
           providerUid,
 
+          amountLkr: finalAmount, // best-effort from invoice.pricing.totalAmount
+          invoiceId: latestInvoiceId,
+
           confirmedByProviderAt: now,
           createdAt: now,
           updatedAt: now,
@@ -107,7 +173,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         { merge: true }
       );
 
-      return { code: 200 as const, payload: { ok: true, paymentId: paymentDocId } };
+      return {
+        code: 200 as const,
+        payload: { ok: true, paymentId: paymentDocId, invoiceId: latestInvoiceId },
+      };
     });
 
     if (result.code !== 200) return res.status(result.code).json(result.payload);

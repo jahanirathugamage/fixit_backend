@@ -55,7 +55,7 @@ async function sendToUserTopic(params: {
 type Body = {
   jobId?: unknown;
   decision?: unknown; // accepted | declined
-  clientVisitationConfirmed?: unknown; // optional
+  clientVisitationConfirmed?: unknown; // required when declined
 };
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -81,13 +81,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!jobId) return res.status(400).json({ error: "jobId is required" });
     if (decision !== "accepted" && decision !== "declined") {
       return res.status(400).json({ error: "decision must be accepted|declined" });
-    }
-
-    // ✅ IMPORTANT: only allow decline if client confirmed payment in UI
-    if (decision === "declined" && !clientVisitationConfirmed) {
-      return res.status(400).json({
-        error: "clientVisitationConfirmed must be true when declining quotation",
-      });
     }
 
     const db = admin.firestore();
@@ -179,7 +172,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       if (quotationId) patch["quotationId"] = quotationId;
       if (contractorId) patch["contractorId"] = contractorId;
 
-      // ✅ IMPORTANT: replace job tasks with quotation tasks (new truth)
+      // ✅ IMPORTANT: replace job tasks/pricing with quotation tasks/pricing (new truth)
       if (qPricing) patch["pricing"] = qPricing;
       if (qTasks) patch["tasks"] = qTasks;
 
@@ -222,6 +215,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     // ---- DECLINED ----
+    // ✅ require client confirmation flag from app (fixes lint + correct behavior)
+    if (!clientVisitationConfirmed) {
+      return res.status(400).json({ error: "clientVisitationConfirmed must be true when declining" });
+    }
+
     const jobPricing =
       (job["pricing"] && typeof job["pricing"] === "object"
         ? (job["pricing"] as Record<string, unknown>)
@@ -242,12 +240,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           quotationDecision: "declined",
           quotationDecisionAt: now,
           updatedAt: now,
-
           ...(quotationId ? { quotationId } : {}),
           ...(contractorId ? { contractorId } : {}),
-
-          // ✅ use the actual boolean passed from the client sheet
-          clientVisitationConfirmed,
+          clientVisitationConfirmed: true,
           clientVisitationConfirmedAt: now,
         },
         { merge: true }
@@ -258,21 +253,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         {
           type: "visitation",
           status: "pending_provider_confirmation",
-
           jobId,
           quotationId: quotationId || null,
           invoiceId: null,
-
           clientId,
           providerUid,
           contractorId: contractorId || null,
-
           currency: "LKR",
           amount: visitationFee,
-
           clientConfirmedAt: now,
           providerConfirmedAt: null,
-
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedAt: now,
         },

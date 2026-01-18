@@ -16,15 +16,6 @@ function asString(v: unknown): string {
   return typeof v === "string" ? v : String(v ?? "");
 }
 
-function asInt(v: unknown, fallback = 0): number {
-  if (typeof v === "number" && Number.isFinite(v)) return Math.round(v);
-  if (typeof v === "string") {
-    const n = Number(v);
-    if (Number.isFinite(n)) return Math.round(n);
-  }
-  return fallback;
-}
-
 function getErrorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
@@ -55,7 +46,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    // ---------------- AUTH ----------------
     const authHeader = req.headers.authorization || "";
     const match = authHeader.match(/^Bearer (.+)$/);
     if (!match) return res.status(401).json({ error: "Missing Bearer token" });
@@ -63,7 +53,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const decoded = await admin.auth().verifyIdToken(match[1]);
     const callerUid = decoded.uid;
 
-    // ---------------- INPUT ----------------
     const body: Body = isRecord(req.body) ? (req.body as Body) : {};
     const jobId = asString(body.jobId).trim();
     const decision = asString(body.decision).trim().toLowerCase();
@@ -73,7 +62,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(400).json({ error: "decision must be accepted|declined" });
     }
 
-    // ---------------- LOAD JOB ----------------
     const jobRef = admin.firestore().collection("jobRequest").doc(jobId);
     const jobSnap = await jobRef.get();
     if (!jobSnap.exists) return res.status(404).json({ error: "Job not found" });
@@ -86,12 +74,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(400).json({ error: "Job missing clientId/selectedProviderUid" });
     }
 
-    // Client must own job
     if (clientId !== callerUid) {
       return res.status(403).json({ error: "Not allowed (not client owner)" });
     }
 
-    // ---------------- LOAD QUOTATION (by jobId) ----------------
+    // Load quotation (NO orderBy, no composite index)
     const qSnap = await admin
       .firestore()
       .collection("quotations")
@@ -107,43 +94,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const quotation = quotationDoc.data() ?? {};
     const contractorId = asString(quotation["contractorId"]).trim();
 
-    const pricing = isRecord(quotation["pricing"]) ? (quotation["pricing"] as Record<string, unknown>) : {};
-    const visitationFee = asInt(pricing["visitationFee"], asInt(job["visitationFee"], 250));
-    const totalAmount = asInt(pricing["totalAmount"], 0);
-    const platformFee = asInt(pricing["platformFee"], 0);
-    const serviceTotal = asInt(pricing["serviceTotal"], 0);
-
-    const tasksRaw = Array.isArray(quotation["tasks"]) ? (quotation["tasks"] as unknown[]) : [];
-    const mappedTasks = tasksRaw.map((t) => {
-      const m = (isRecord(t) ? t : {}) as Record<string, unknown>;
-      return {
-        label: asString(m["label"]).trim(),
-        quantity: asInt(m["quantity"], 1),
-        unitPrice: asInt(m["unitPrice"], 0),
-        lineTotal: asInt(m["lineTotal"], 0),
-      };
-    });
-
     const providerName =
       asString(job["providerName"] ?? job["selectedProviderName"] ?? job["serviceProviderName"]).trim() ||
       "Service Provider";
 
-    // ---------------- APPLY DECISION ----------------
     if (decision === "declined") {
-      // client declined → provider must confirm visitation fee payment
       await jobRef.set(
         {
           status: "quotation_declined_pending_visitation",
           quotationId: quotationDoc.id,
+          contractorId: contractorId || admin.firestore.FieldValue.delete(),
           quotationDecision: "declined",
           quotationDecisionAt: admin.firestore.FieldValue.serverTimestamp(),
-          visitationFee, // store for later analytics + payment creation
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         },
         { merge: true }
       );
 
-      // notify provider to confirm visitation payment
       await sendToUserTopic({
         userUid: selectedProviderUid,
         title: "Quotation Declined",
@@ -156,7 +123,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         },
       });
 
-      // notify contractor (optional but useful)
       if (contractorId) {
         await sendToUserTopic({
           userUid: contractorId,
@@ -173,32 +139,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(200).json({ ok: true });
     }
 
-    // decision === "accepted"
-    // client accepted → job task list & pricing updated for all parties
+    // ✅ ACCEPTED: DO NOT overwrite jobRequest.tasks/pricing.
+    // Keep original job request details intact.
     await jobRef.set(
       {
         status: "quotation_accepted",
         quotationId: quotationDoc.id,
+        contractorId: contractorId || admin.firestore.FieldValue.delete(),
         quotationDecision: "accepted",
         quotationDecisionAt: admin.firestore.FieldValue.serverTimestamp(),
-
-        // overwrite tasks with quotation tasks
-        tasks: mappedTasks,
-
-        // store pricing summary on jobRequest for UI + analytics
-        pricing: {
-          visitationFee,
-          platformFee,
-          serviceTotal,
-          totalAmount,
-        },
-
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
 
-    // notify contractor: button becomes Invoice on their UI (you’ll handle UI)
     if (contractorId) {
       await sendToUserTopic({
         userUid: contractorId,
@@ -212,11 +166,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       });
     }
 
-    // notify provider: job details updated
     await sendToUserTopic({
       userUid: selectedProviderUid,
       title: "Quotation Accepted",
-      body: "Client accepted the quotation. Job details have been updated.",
+      body: "Client accepted the quotation. Updated job details are available.",
       data: {
         route: "/provider/job_details",
         jobId,
@@ -224,7 +177,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       },
     });
 
-    // notify client: open updated job details
     await sendToUserTopic({
       userUid: clientId,
       title: "Quotation Accepted",
