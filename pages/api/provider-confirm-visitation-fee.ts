@@ -1,4 +1,5 @@
 // pages/api/provider-confirm-visitation-fee.ts
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 
@@ -28,6 +29,20 @@ function asInt(v: unknown, fallback = 0): number {
 function getErrorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
+}
+
+async function sendToUserTopic(params: {
+  userUid: string;
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+}) {
+  await admin.messaging().send({
+    topic: `user_${params.userUid}`,
+    notification: { title: params.title, body: params.body },
+    data: params.data ?? {},
+    android: { priority: "high" },
+  });
 }
 
 type Body = { jobId?: unknown };
@@ -73,7 +88,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         return { code: 403 as const, payload: { error: "Not allowed (not selected provider)" } };
       }
 
-      // ✅ Allow all the “declined → visitation confirm” variants you currently use
+      // ✅ Allow all the “declined → visitation confirm” variants you use
       const allowedStates = new Set([
         "awaiting_visitation_fee_confirmation",
         "quotation_declined_pending_visitation",
@@ -90,8 +105,32 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         return { code: 400 as const, payload: { error: "Job is not awaiting visitation fee confirmation" } };
       }
 
+      // ✅ Dual-confirm requirement: client must confirm first
+      const clientConfirmedAt = job["clientVisitationConfirmedAt"];
+      const hasClientConfirm = !!clientConfirmedAt;
+      if (!hasClientConfirm) {
+        return {
+          code: 400 as const,
+          payload: { error: "Client has not confirmed visitation payment yet." },
+        };
+      }
+
       const pricing = isRecord(job["pricing"]) ? (job["pricing"] as Record<string, unknown>) : {};
       const visitationFee = asInt(pricing["visitationFee"], asInt(job["visitationFee"], 250));
+
+      // ✅ Get latest quotationId for linking payment (optional)
+      let quotationId = "";
+      try {
+        const qQuery = db
+          .collection("quotations")
+          .where("jobId", "==", jobId)
+          .orderBy("createdAt", "desc")
+          .limit(1);
+        const qSnap = await tx.get(qQuery);
+        if (!qSnap.empty) quotationId = qSnap.docs[0].id;
+      } catch {
+        // ignore
+      }
 
       const now = admin.firestore.FieldValue.serverTimestamp();
 
@@ -105,9 +144,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           amount: visitationFee,
 
           jobRequestId: jobId,
+          quotationId: quotationId || null,
+
           clientId,
           providerUid,
 
+          clientConfirmedAt: clientConfirmedAt ?? null,
           confirmedByProviderAt: now,
           createdAt: now,
           updatedAt: now,
@@ -115,47 +157,46 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         { merge: true }
       );
 
-      // ✅ Close job
+      // ✅ Close job ONLY after both confirmations
       tx.set(
         jobRef,
         {
           status: "terminated_after_quotation_decline",
           terminatedAt: now,
           visitationFeeConfirmedAt: now,
+          providerVisitationConfirmedAt: now,
           updatedAt: now,
         },
         { merge: true }
       );
 
-      return { code: 200 as const, payload: { ok: true, paymentId: paymentDocId } };
+      return { code: 200 as const, payload: { ok: true, paymentId: paymentDocId, quotationId } };
     });
 
     if (result.code !== 200) return res.status(result.code).json(result.payload);
 
-    // Notify client (safe, outside transaction)
+    // Notify client (outside transaction)
     try {
       const jobSnap = await jobRef.get();
       const job = jobSnap.data() ?? {};
       const clientId = asString(job["clientId"]).trim();
 
       if (clientId) {
-        await admin.messaging().send({
-          topic: `user_${clientId}`,
-          notification: {
-            title: "Job Closed",
-            body: "Thank you for using FixIt, we are happy to serve you.",
-          },
+        await sendToUserTopic({
+          userUid: clientId,
+          title: "Job Closed",
+          body: "Thank you for using FixIt, we are happy to serve you.",
           data: {
             type: "visitation_fee_confirmed",
-            route: "/dashboards/client/client_jobs",
+            // ✅ go home so you can show Image 5 sheet there
+            route: "/dashboards/client/home_client",
             jobId,
             click_action: "FLUTTER_NOTIFICATION_CLICK",
           },
-          android: { priority: "high" },
         });
       }
     } catch {
-      // ignore notification failures
+      // ignore
     }
 
     return res.status(200).json(result.payload);

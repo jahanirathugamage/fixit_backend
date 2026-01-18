@@ -13,14 +13,49 @@ function asString(v: unknown): string {
   return typeof v === "string" ? v : String(v ?? "");
 }
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
 function getErrorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
 }
 
+function asBool(v: unknown): boolean {
+  if (v === true) return true;
+  const s = asString(v).trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes";
+}
+
+function asInt(v: unknown): number {
+  if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
+  if (typeof v === "string") {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+async function sendToUserTopic(params: {
+  userUid: string;
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+}) {
+  const topic = `user_${params.userUid}`;
+  await admin.messaging().send({
+    topic,
+    notification: { title: params.title, body: params.body },
+    data: params.data ?? {},
+    android: { priority: "high" },
+  });
+}
+
 type Body = {
   jobId?: unknown;
   decision?: unknown; // accepted | declined
+  clientVisitationConfirmed?: unknown; // optional
 };
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -29,6 +64,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
+    // ---- AUTH ----
     const authHeader = req.headers.authorization || "";
     const match = authHeader.match(/^Bearer (.+)$/);
     if (!match) return res.status(401).json({ error: "Missing Bearer token" });
@@ -36,17 +72,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const decoded = await admin.auth().verifyIdToken(match[1]);
     const callerUid = decoded.uid;
 
-    const body: Body = (req.body ?? {}) as Body;
-
+    // ---- INPUT ----
+    const body: Body = isRecord(req.body) ? (req.body as Body) : {};
     const jobId = asString(body.jobId).trim();
     const decision = asString(body.decision).trim().toLowerCase(); // accepted|declined
+    const clientVisitationConfirmed = asBool(body.clientVisitationConfirmed);
 
     if (!jobId) return res.status(400).json({ error: "jobId is required" });
     if (decision !== "accepted" && decision !== "declined") {
       return res.status(400).json({ error: "decision must be accepted|declined" });
     }
 
-    const jobRef = admin.firestore().collection("jobRequest").doc(jobId);
+    const db = admin.firestore();
+
+    const jobRef = db.collection("jobRequest").doc(jobId);
     const snap = await jobRef.get();
     if (!snap.exists) return res.status(404).json({ error: "Job not found" });
 
@@ -62,46 +101,201 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(403).json({ error: "Not allowed (not job client)" });
     }
 
+    // ---- Load latest quotation (for quotationId + contractorId + pricing/tasks sync) ----
+    let contractorId = "";
+    let quotationId = asString(job["quotationId"]).trim(); // jobRequest already stores it sometimes (your screenshot)
+
+    let qPricing: Record<string, unknown> | null = null;
+    let qTasks: unknown[] | null = null;
+
+    try {
+      const qSnap = await db
+        .collection("quotations")
+        .where("jobId", "==", jobId)
+        .orderBy("createdAt", "desc")
+        .limit(1)
+        .get();
+
+      if (!qSnap.empty) {
+        const qDoc = qSnap.docs[0];
+        quotationId = quotationId || qDoc.id;
+        const qData = qDoc.data() ?? {};
+        contractorId = asString(qData["contractorId"]).trim();
+
+        const pricingMaybe = qData["pricing"];
+        if (pricingMaybe && typeof pricingMaybe === "object") {
+          qPricing = pricingMaybe as Record<string, unknown>;
+        }
+
+        const tasksMaybe = qData["tasks"];
+        if (Array.isArray(tasksMaybe)) {
+          qTasks = tasksMaybe as unknown[];
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    // ---- ACCEPTED ----
     if (decision === "accepted") {
-      await jobRef.set(
+      // Sync job tasks/pricing with quotation so client/provider/admin see quotation-updated version
+      const patch: Record<string, unknown> = {
+        status: "quotation_accepted",
+        quotationDecision: "accepted",
+        quotationDecisionAt: now,
+        updatedAt: now,
+      };
+
+      if (quotationId) patch["quotationId"] = quotationId;
+      if (contractorId) patch["contractorId"] = contractorId;
+
+      // Copy quotation fields if available
+      if (qPricing) patch["pricing"] = qPricing;
+      if (qTasks) patch["tasks"] = qTasks;
+
+      await jobRef.set(patch, { merge: true });
+
+      // Notify provider + contractor (best-effort)
+      try {
+        await sendToUserTopic({
+          userUid: providerUid,
+          title: "Quotation Accepted",
+          body: "Client accepted the quotation. You can proceed with the job.",
+          data: {
+            type: "provider_quotation_accepted",
+            route: "/provider/job_details",
+            jobId,
+            quotationId,
+            click_action: "FLUTTER_NOTIFICATION_CLICK",
+          },
+        });
+      } catch {}
+
+      if (contractorId) {
+        try {
+          await sendToUserTopic({
+            userUid: contractorId,
+            title: "Quotation Accepted",
+            body: "Client accepted the quotation.",
+            data: {
+              type: "contractor_quotation_accepted",
+              route: "/dashboards/contractor/contractor_jobs_screen",
+              jobId,
+              quotationId,
+              click_action: "FLUTTER_NOTIFICATION_CLICK",
+            },
+          });
+        } catch {}
+      }
+
+      return res.status(200).json({ ok: true, quotationId });
+    }
+
+    // ---- DECLINED ----
+    // Your Firestore screenshot expects:
+    // status: "quotation_declined_pending_visitation"
+    // and jobRequest has quotationId.
+
+    // Determine visitation fee amount for payment schema
+    const jobPricing = (job["pricing"] && typeof job["pricing"] === "object" ? (job["pricing"] as Record<string, unknown>) : {}) as Record<
+      string,
+      unknown
+    >;
+
+    const fromJob = asInt(jobPricing["visitationFee"] ?? job["visitationFeeLkr"]);
+    const fromQuotation = qPricing ? asInt(qPricing["visitationFee"]) : 0;
+    const visitationFee = fromQuotation > 0 ? fromQuotation : fromJob;
+
+    // Payment doc: we create/merge a deterministic "pending" record now.
+    // Provider confirmation endpoint can finalize it later (set providerConfirmedAt + status=finalized).
+    const paymentId = quotationId ? `visitation_${jobId}_${quotationId}` : `visitation_${jobId}`;
+    const paymentRef = db.collection("payments").doc(paymentId);
+
+    await db.runTransaction(async (tx) => {
+      // 1) update job
+      tx.set(
+        jobRef,
         {
-          status: "quotation_accepted",
-          quotationDecisionAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          status: "quotation_declined_pending_visitation",
+          quotationDecision: "declined",
+          quotationDecisionAt: now,
+          updatedAt: now,
+
+          ...(quotationId ? { quotationId } : {}),
+          ...(contractorId ? { contractorId } : {}),
+
+          // client-side confirmation stamp
+          clientVisitationConfirmed: true,
+          clientVisitationConfirmedAt: now,
         },
         { merge: true }
       );
 
-      return res.status(200).json({ ok: true });
-    }
+      // 2) upsert payment (pending provider confirmation)
+      tx.set(
+        paymentRef,
+        {
+          type: "visitation",
+          status: "pending_provider_confirmation",
 
-    // Declined → provider must confirm visitation fee
-    await jobRef.set(
-      {
-        status: "awaiting_visitation_fee_confirmation",
-        quotationDecisionAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+          jobId,
+          quotationId: quotationId || null,
+          invoiceId: null,
 
-    // Notify provider to confirm visitation fee
-    await admin.messaging().send({
-      topic: `user_${providerUid}`,
-      notification: {
-        title: "Visitation Fee",
-        body: "Client declined the quotation. Please confirm visitation fee received.",
-      },
-      data: {
-        type: "provider_confirm_visitation_fee",
-        route: "/provider/confirm_visitation_fee",
-        jobId,
-        click_action: "FLUTTER_NOTIFICATION_CLICK",
-      },
-      android: { priority: "high" },
+          clientId,
+          providerUid,
+          contractorId: contractorId || null,
+
+          currency: "LKR",
+          amount: visitationFee,
+
+          clientConfirmedAt: now,
+          providerConfirmedAt: null,
+
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: now,
+        },
+        { merge: true }
+      );
     });
 
-    return res.status(200).json({ ok: true });
+    // Notify provider to confirm visitation fee (opens job details; UI auto shows sheet)
+    try {
+      await sendToUserTopic({
+        userUid: providerUid,
+        title: "Visitation Fee",
+        body: "Client declined the quotation. Please confirm visitation fee received.",
+        data: {
+          type: "provider_confirm_visitation_fee",
+          route: "/provider/confirm_visitation_fee",
+          jobId,
+          quotationId,
+          click_action: "FLUTTER_NOTIFICATION_CLICK",
+        },
+      });
+    } catch {}
+
+    // Notify contractor (best-effort)
+    if (contractorId) {
+      try {
+        await sendToUserTopic({
+          userUid: contractorId,
+          title: "Quotation Declined",
+          body: "Client declined the quotation.",
+          data: {
+            type: "contractor_quotation_declined",
+            route: "/dashboards/contractor/contractor_jobs_screen",
+            jobId,
+            quotationId,
+            click_action: "FLUTTER_NOTIFICATION_CLICK",
+          },
+        });
+      } catch {}
+    }
+
+    return res.status(200).json({ ok: true, quotationId, paymentId });
   } catch (e: unknown) {
     return res.status(500).json({ error: getErrorMessage(e) });
   }

@@ -163,7 +163,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           title: "Quotation Declined",
           body: "Client declined the quotation. Visitation fee confirmation is pending.",
           data: {
-            route: "/dashboards/contractor/contractor_jobs",
+            route: "/dashboards/contractor/contractor_jobs_screen",
             jobId,
             click_action: "FLUTTER_NOTIFICATION_CLICK",
           },
@@ -205,7 +205,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         title: "Quotation Accepted",
         body: "Client accepted the quotation. You can now generate the invoice.",
         data: {
-          route: "/dashboards/contractor/contractor_jobs",
+          route: "/dashboards/contractor/contractor_jobs_screen",
           jobId,
           click_action: "FLUTTER_NOTIFICATION_CLICK",
         },
