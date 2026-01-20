@@ -89,9 +89,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         };
       }
 
-      // ✅ Accept BOTH for backwards compatibility:
-      // - Old flow: completed_pending_payment
-      // - New flow: awaiting_final_payment_confirmation
+      // ✅ Accept BOTH states (backwards compatibility)
       const allowed =
         status === "awaiting_final_payment_confirmation" || status === "completed_pending_payment";
 
@@ -104,42 +102,65 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       const now = admin.firestore.FieldValue.serverTimestamp();
 
-      // ✅ Find latest invoice for this job (if any) and mark it confirmed
-      const invoiceQuery = db
-        .collection("invoices")
-        .where("jobId", "==", jobId)
-        .orderBy("createdAt", "desc")
-        .limit(1);
-
-      const invoiceSnap = await tx.get(invoiceQuery);
-
-      let latestInvoiceId = "";
+      // ✅ NO INDEX: Prefer latestInvoiceId from job, fallback to simple where(jobId).limit(1)
+      let latestInvoiceId = asString(job["latestInvoiceId"]).trim();
       let finalAmount = 0;
 
-      if (!invoiceSnap.empty) {
-        const doc = invoiceSnap.docs[0];
-        latestInvoiceId = doc.id;
+      if (latestInvoiceId) {
+        const invRef = db.collection("invoices").doc(latestInvoiceId);
+        const invSnap = await tx.get(invRef);
 
-        const inv = doc.data() ?? {};
-        const rawPricing = inv["pricing"];
+        if (invSnap.exists) {
+          const inv = invSnap.data() ?? {};
+          const rawPricing = inv["pricing"];
+          let pricing: InvoicePricing = {};
+          if (isRecord(rawPricing)) pricing = rawPricing as InvoicePricing;
 
-        let pricing: InvoicePricing = {};
-        if (isRecord(rawPricing)) pricing = rawPricing as InvoicePricing;
+          finalAmount = asNumber(pricing.totalAmount);
 
-        finalAmount = asNumber(pricing.totalAmount);
-
-        tx.set(
-          db.collection("invoices").doc(latestInvoiceId),
-          {
-            status: "paid_confirmed_by_provider",
-            providerConfirmedAt: now,
-            updatedAt: now,
-          },
-          { merge: true }
-        );
+          tx.set(
+            invRef,
+            {
+              status: "paid_confirmed_by_provider",
+              providerConfirmedAt: now,
+              updatedAt: now,
+            },
+            { merge: true }
+          );
+        } else {
+          // if job.latestInvoiceId points to a missing doc, clear it and fallback
+          latestInvoiceId = "";
+        }
       }
 
-      // ✅ Update job status to COMPLETED (do NOT hide it here)
+      if (!latestInvoiceId) {
+        const invQ = db.collection("invoices").where("jobId", "==", jobId).limit(1); // ✅ no orderBy
+        const invSnap = await tx.get(invQ);
+
+        if (!invSnap.empty) {
+          const doc = invSnap.docs[0];
+          latestInvoiceId = doc.id;
+
+          const inv = doc.data() ?? {};
+          const rawPricing = inv["pricing"];
+          let pricing: InvoicePricing = {};
+          if (isRecord(rawPricing)) pricing = rawPricing as InvoicePricing;
+
+          finalAmount = asNumber(pricing.totalAmount);
+
+          tx.set(
+            db.collection("invoices").doc(latestInvoiceId),
+            {
+              status: "paid_confirmed_by_provider",
+              providerConfirmedAt: now,
+              updatedAt: now,
+            },
+            { merge: true }
+          );
+        }
+      }
+
+      // ✅ Update job status to COMPLETED (do NOT hide it)
       tx.set(
         jobRef,
         {
