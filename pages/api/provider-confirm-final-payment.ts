@@ -80,8 +80,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         return { code: 403 as const, payload: { error: "Not allowed (not selected provider)" } };
       }
 
-      // ✅ Idempotent
-      const alreadyConfirmed = !!job["finalPaymentConfirmedAt"] || status === "completed";
+      // ✅ Idempotent (treat job_completed as already done)
+      const alreadyConfirmed =
+        !!job["finalPaymentConfirmedAt"] || status === "completed" || status === "job_completed";
+
       if (alreadyConfirmed) {
         return {
           code: 200 as const,
@@ -128,7 +130,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             { merge: true }
           );
         } else {
-          // if job.latestInvoiceId points to a missing doc, clear it and fallback
           latestInvoiceId = "";
         }
       }
@@ -160,11 +161,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         }
       }
 
-      // ✅ Update job status to COMPLETED (do NOT hide it)
+      // ✅ IMPORTANT CHANGE:
+      // After BOTH confirmations, set to FINAL HIDDEN status.
       tx.set(
         jobRef,
         {
-          status: "completed",
+          status: "job_completed",
           finalPaymentConfirmedAt: now,
           updatedAt: now,
           latestInvoiceId: latestInvoiceId || asString(job["latestInvoiceId"]).trim(),
@@ -184,7 +186,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           clientId,
           providerUid,
 
-          amountLkr: finalAmount, // best-effort from invoice.pricing.totalAmount
+          amountLkr: finalAmount,
           invoiceId: latestInvoiceId,
 
           confirmedByProviderAt: now,
