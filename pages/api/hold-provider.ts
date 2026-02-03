@@ -18,6 +18,18 @@ function addMinutes(ts: admin.firestore.Timestamp, mins: number) {
   return admin.firestore.Timestamp.fromMillis(ms);
 }
 
+function addDays(date: Date, days: number) {
+  const d = new Date(date.getTime());
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function addMonths(date: Date, months: number) {
+  const d = new Date(date.getTime());
+  d.setMonth(d.getMonth() + months);
+  return d;
+}
+
 async function getCallerRole(uid: string): Promise<string | null> {
   const snap = await admin.firestore().collection("users").doc(uid).get();
   return snap.exists ? (snap.data()?.role as string) : null;
@@ -90,13 +102,6 @@ function computeTotalDurationMinutes(
   return total;
 }
 
-/**
- * Availability check with ONLY ONE inequality in Firestore query.
- * We query:
- *   where("blockStartAt", "<", requestedBlockEnd)
- * Then we filter overlap (blockEndAt > requestedBlockStart) in code.
- * Also ignores expired holds.
- */
 async function providerHasOverlap(
   providerUid: string,
   requestedBlockStart: admin.firestore.Timestamp,
@@ -122,15 +127,11 @@ async function providerHasOverlap(
     const blockEndAt = b.blockEndAt as admin.firestore.Timestamp | undefined;
     if (!blockStartAt || !blockEndAt) continue;
 
-    // Ignore expired holds
     if (status === "held") {
       const holdExpiresAt = b.holdExpiresAt as admin.firestore.Timestamp | undefined;
-      if (holdExpiresAt && holdExpiresAt.toMillis() < now.toMillis()) {
-        continue;
-      }
+      if (holdExpiresAt && holdExpiresAt.toMillis() < now.toMillis()) continue;
     }
 
-    // Overlap check in code
     const overlaps =
       blockStartAt.toMillis() < requestedBlockEnd.toMillis() &&
       blockEndAt.toMillis() > requestedBlockStart.toMillis();
@@ -139,6 +140,84 @@ async function providerHasOverlap(
   }
 
   return false;
+}
+
+function weekdayIndexFromString(v: any): number | null {
+  const s = String(v ?? "").trim().toLowerCase();
+  const map: Record<string, number> = {
+    sunday: 0,
+    sun: 0,
+    monday: 1,
+    mon: 1,
+    tuesday: 2,
+    tue: 2,
+    wednesday: 3,
+    wed: 3,
+    thursday: 4,
+    thu: 4,
+    friday: 5,
+    fri: 5,
+    saturday: 6,
+    sat: 6,
+  };
+  return map[s] ?? null;
+}
+
+function parseFrequency(raw: any): { unit: "week" | "month"; interval: number } {
+  const s = String(raw ?? "").trim().toLowerCase();
+  const m = s.match(/(\d+)\s*(week|weeks|month|months)/i);
+  if (!m) return { unit: "week", interval: 1 };
+  const interval = Math.max(1, Number(m[1] ?? 1));
+  const unitRaw = (m[2] ?? "week").toLowerCase();
+  if (unitRaw.startsWith("month")) return { unit: "month", interval };
+  return { unit: "week", interval };
+}
+
+function computeOccurrences({
+  startAt,
+  preferredDay,
+  frequency,
+  count,
+}: {
+  startAt: admin.firestore.Timestamp;
+  preferredDay: any;
+  frequency: any;
+  count: number;
+}): admin.firestore.Timestamp[] {
+  const baseDate = startAt.toDate();
+  const preferred = weekdayIndexFromString(preferredDay);
+  const freq = parseFrequency(frequency);
+
+  let first = new Date(baseDate.getTime());
+  if (preferred !== null) {
+    while (first.getDay() !== preferred) {
+      first = addDays(first, 1);
+    }
+  }
+
+  const out: admin.firestore.Timestamp[] = [];
+  let current = first;
+
+  for (let i = 0; i < count; i++) {
+    out.push(admin.firestore.Timestamp.fromDate(new Date(current.getTime())));
+
+    if (freq.unit === "week") {
+      current = addDays(current, freq.interval * 7);
+    } else {
+      const moved = addMonths(current, freq.interval);
+      let aligned = new Date(moved.getTime());
+
+      if (preferred !== null) {
+        aligned = new Date(moved.getFullYear(), moved.getMonth(), 1, moved.getHours(), moved.getMinutes(), 0, 0);
+        while (aligned.getDay() !== preferred) aligned = addDays(aligned, 1);
+      }
+
+      aligned.setHours(baseDate.getHours(), baseDate.getMinutes(), 0, 0);
+      current = aligned;
+    }
+  }
+
+  return out;
 }
 
 export default async function handler(
@@ -152,7 +231,6 @@ export default async function handler(
     return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    // 1) Auth client
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ")
       ? authHeader.slice(7)
@@ -164,12 +242,9 @@ export default async function handler(
 
     const role = await getCallerRole(callerUid);
     if (role !== "client") {
-      return res
-        .status(403)
-        .json({ error: "Only clients can hold providers." });
+      return res.status(403).json({ error: "Only clients can hold providers." });
     }
 
-    // 2) Body
     const { jobId = "", providerUid = "" } = req.body || {};
     const jobRequestId = String(jobId).trim();
     const pUid = String(providerUid).trim();
@@ -179,39 +254,26 @@ export default async function handler(
 
     const db = admin.firestore();
 
-    // 3) Load jobRequest
     const jobRef = db.collection("jobRequest").doc(jobRequestId);
     const jobSnap = await jobRef.get();
-    if (!jobSnap.exists) {
-      return res.status(404).json({ error: "Job request not found." });
-    }
+    if (!jobSnap.exists) return res.status(404).json({ error: "Job request not found." });
 
     const job = jobSnap.data() as any;
 
-    // Basic validation
-    const isNow = Boolean(job.isNow);
-    const scheduledDate = job.scheduledDate as admin.firestore.Timestamp | undefined;
-
     const category = normalizeCategory(job.categoryNormalized ?? job.category);
     if (!category) {
-      return res
-        .status(400)
-        .json({ error: "Job request missing category/categoryNormalized." });
+      return res.status(400).json({ error: "Job request missing category/categoryNormalized." });
     }
 
     const jobLocation = job.location as admin.firestore.GeoPoint | undefined;
     if (!jobLocation) {
-      return res
-        .status(400)
-        .json({ error: "Job request missing location GeoPoint." });
+      return res.status(400).json({ error: "Job request missing location GeoPoint." });
     }
 
     const tasks = Array.isArray(job.tasks) ? job.tasks : [];
 
-    // 4) Compute time window
-    const startAt: admin.firestore.Timestamp = isNow
-      ? admin.firestore.Timestamp.now()
-      : scheduledDate ?? admin.firestore.Timestamp.now();
+    const startAtBase: admin.firestore.Timestamp =
+      (job.scheduledDate as admin.firestore.Timestamp | undefined) ?? admin.firestore.Timestamp.now();
 
     const labels = tasks
       .map((t: any) => String(t?.label ?? "").trim())
@@ -223,55 +285,89 @@ export default async function handler(
     const bufferBeforeMins = 60;
     const bufferAfterMins = 60;
 
-    const endAt = addMinutes(startAt, totalDurationMins);
-    const blockStartAt = addMinutes(startAt, -bufferBeforeMins);
-    const blockEndAt = addMinutes(endAt, bufferAfterMins);
+    const isRecurring = Boolean(job.isRecurring);
+    const recurrence = job.recurrence ?? {};
+    const preferredDay = recurrence.preferredDay ?? recurrence.day ?? null;
+    const frequency = recurrence.frequency ?? recurrence.interval ?? "1 week";
+    const horizon = Number(recurrence.horizonCount ?? 6);
+    const occCount = Number.isFinite(horizon) ? Math.min(Math.max(horizon, 2), 12) : 6;
 
-    // 5) Ensure provider is still available
-    const hasOverlap = await providerHasOverlap(pUid, blockStartAt, blockEndAt);
-    if (hasOverlap) {
-      return res.status(409).json({
-        error: "Provider unavailable",
-        message:
-          "This provider has an overlapping booking/hold. Please select another provider.",
-      });
+    const occurrenceStarts = isRecurring
+      ? computeOccurrences({
+          startAt: startAtBase,
+          preferredDay,
+          frequency,
+          count: occCount,
+        })
+      : [startAtBase];
+
+    const requestedWindows = occurrenceStarts.map((occStart) => {
+      const endAt = addMinutes(occStart, totalDurationMins);
+      const blockStartAt = addMinutes(occStart, -bufferBeforeMins);
+      const blockEndAt = addMinutes(endAt, bufferAfterMins);
+      return { occStart, endAt, blockStartAt, blockEndAt };
+    });
+
+    // Ensure provider is still available for ALL occurrences
+    for (const w of requestedWindows) {
+      const hasOverlap = await providerHasOverlap(pUid, w.blockStartAt, w.blockEndAt);
+      if (hasOverlap) {
+        return res.status(409).json({
+          error: "Provider unavailable",
+          message:
+            "This provider has an overlapping booking/hold. Please select another provider.",
+        });
+      }
     }
 
-    // 6) Create hold
-    const holdMinutes = 10; // change if needed
+    // Create holds
+    const holdMinutes = 10;
     const now = admin.firestore.Timestamp.now();
     const holdExpiresAt = addMinutes(now, holdMinutes);
 
-    const holdRef = db
-      .collection("serviceProviders")
-      .doc(pUid)
-      .collection("timeBlocks")
-      .doc(); // auto id
+    const holds: { holdId: string; startAt: string }[] = [];
 
-    // Use serverTimestamp for createdAt (and keep a deterministic now field too if you want)
-    await holdRef.set({
-      status: "held",
-      jobId: jobRequestId,
-      clientId: callerUid,
+    for (let i = 0; i < requestedWindows.length; i++) {
+      const w = requestedWindows[i];
 
-      startAt,
-      endAt,
-      blockStartAt,
-      blockEndAt,
+      const holdRef = db
+        .collection("serviceProviders")
+        .doc(pUid)
+        .collection("timeBlocks")
+        .doc();
 
-      holdExpiresAt,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+      await holdRef.set({
+        status: "held",
+        jobId: jobRequestId,
+        clientId: callerUid,
 
-    // 7) Save selection onto jobRequest so PROVIDER can see it
-    // Important: use selectedProviderUid (this is what your rules + provider screens should use)
-    // Also set a consistent request status the provider screen can query.
+        // actual service window for this occurrence
+        startAt: w.occStart,
+        endAt: w.endAt,
+
+        // padded block for availability
+        blockStartAt: w.blockStartAt,
+        blockEndAt: w.blockEndAt,
+
+        // recurring linkage
+        isRecurring: isRecurring,
+        occurrenceIndex: i,
+        recurrenceJobId: isRecurring ? jobRequestId : null,
+
+        holdExpiresAt,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      holds.push({ holdId: holdRef.id, startAt: w.occStart.toDate().toISOString() });
+    }
+
+    // Save selection onto jobRequest for provider to see
     await jobRef.set(
       {
         selectedProviderUid: pUid,
-        holdId: holdRef.id,
+        holdId: holds[0]?.holdId ?? null,
         holdExpiresAt,
-        status: "requested", // ✅ better than "holding" for provider flow
+        status: "requested",
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true },
@@ -281,10 +377,11 @@ export default async function handler(
       ok: true,
       jobId: jobRequestId,
       providerUid: pUid,
-      holdId: holdRef.id,
+      holds,
       holdExpiresAt: holdExpiresAt.toDate().toISOString(),
       holdMinutes,
       status: "requested",
+      isRecurring,
     });
   } catch (err: any) {
     console.error("hold-provider error:", err);

@@ -32,6 +32,18 @@ function addMinutes(ts: admin.firestore.Timestamp, mins: number) {
   return admin.firestore.Timestamp.fromMillis(ms);
 }
 
+function addDays(date: Date, days: number) {
+  const d = new Date(date.getTime());
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function addMonths(date: Date, months: number) {
+  const d = new Date(date.getTime());
+  d.setMonth(d.getMonth() + months);
+  return d;
+}
+
 async function getCallerRole(uid: string): Promise<string | null> {
   const snap = await admin.firestore().collection("users").doc(uid).get();
   return snap.exists ? (snap.data()?.role as string) : null;
@@ -39,7 +51,6 @@ async function getCallerRole(uid: string): Promise<string | null> {
 
 /**
  * Looks up serviceTasks duration by taskName (jobRequest.tasks[].label).
- * Simple implementation: 1 query per unique label.
  */
 async function fetchDurationsByLabels(
   labels: string[],
@@ -108,7 +119,6 @@ async function providerHasOverlap(
   const db = admin.firestore();
   const now = admin.firestore.Timestamp.now();
 
-  // ✅ Only ONE inequality in Firestore query (no composite index needed)
   const blocksSnap = await db
     .collection("serviceProviders")
     .doc(providerUid)
@@ -126,15 +136,11 @@ async function providerHasOverlap(
     const blockEndAt = b.blockEndAt as admin.firestore.Timestamp | undefined;
     if (!blockStartAt || !blockEndAt) continue;
 
-    // Ignore expired holds
     if (status === "held") {
       const holdExpiresAt = b.holdExpiresAt as admin.firestore.Timestamp | undefined;
-      if (holdExpiresAt && holdExpiresAt.toMillis() < now.toMillis()) {
-        continue;
-      }
+      if (holdExpiresAt && holdExpiresAt.toMillis() < now.toMillis()) continue;
     }
 
-    // ✅ Do the second overlap check in code
     const overlaps =
       blockStartAt.toMillis() < requestedBlockEnd.toMillis() &&
       blockEndAt.toMillis() > requestedBlockStart.toMillis();
@@ -143,6 +149,99 @@ async function providerHasOverlap(
   }
 
   return false;
+}
+
+function weekdayIndexFromString(v: any): number | null {
+  const s = String(v ?? "").trim().toLowerCase();
+  const map: Record<string, number> = {
+    sunday: 0,
+    sun: 0,
+    monday: 1,
+    mon: 1,
+    tuesday: 2,
+    tue: 2,
+    wednesday: 3,
+    wed: 3,
+    thursday: 4,
+    thu: 4,
+    friday: 5,
+    fri: 5,
+    saturday: 6,
+    sat: 6,
+  };
+  return map[s] ?? null;
+}
+
+function parseFrequency(raw: any): { unit: "week" | "month"; interval: number } {
+  const s = String(raw ?? "").trim().toLowerCase();
+  // expected values: "1 week", "2 weeks", "3 weeks", "1 month", "2 months", ...
+  const m = s.match(/(\d+)\s*(week|weeks|month|months)/i);
+  if (!m) return { unit: "week", interval: 1 };
+  const interval = Math.max(1, Number(m[1] ?? 1));
+  const unitRaw = (m[2] ?? "week").toLowerCase();
+  if (unitRaw.startsWith("month")) return { unit: "month", interval };
+  return { unit: "week", interval };
+}
+
+/**
+ * Compute upcoming occurrences based on:
+ * - startAt (Timestamp)
+ * - preferredDay (Mon/Tue/...)
+ * - frequency (e.g., "Every 2 months" or "2 months")
+ *
+ * We keep the time-of-day from the startAt.
+ * Horizon is limited (default 6 occurrences) to keep queries practical.
+ */
+function computeOccurrences({
+  startAt,
+  preferredDay,
+  frequency,
+  count,
+}: {
+  startAt: admin.firestore.Timestamp;
+  preferredDay: any;
+  frequency: any;
+  count: number;
+}): admin.firestore.Timestamp[] {
+  const baseDate = startAt.toDate();
+  const preferred = weekdayIndexFromString(preferredDay);
+  const freq = parseFrequency(frequency);
+
+  // Align the first occurrence to preferred weekday (>= start date).
+  let first = new Date(baseDate.getTime());
+  if (preferred !== null) {
+    while (first.getDay() !== preferred) {
+      first = addDays(first, 1);
+    }
+  }
+
+  const out: admin.firestore.Timestamp[] = [];
+  let current = first;
+
+  for (let i = 0; i < count; i++) {
+    out.push(admin.firestore.Timestamp.fromDate(new Date(current.getTime())));
+
+    if (freq.unit === "week") {
+      current = addDays(current, freq.interval * 7);
+    } else {
+      // Month-based recurrence:
+      // Move ahead by N months, then align to preferred weekday within that month.
+      const moved = addMonths(current, freq.interval);
+      let aligned = new Date(moved.getTime());
+
+      if (preferred !== null) {
+        // Set to first day of month then move forward until weekday matches
+        aligned = new Date(moved.getFullYear(), moved.getMonth(), 1, moved.getHours(), moved.getMinutes(), 0, 0);
+        while (aligned.getDay() !== preferred) aligned = addDays(aligned, 1);
+      }
+
+      // keep same time-of-day as original startAt
+      aligned.setHours(baseDate.getHours(), baseDate.getMinutes(), 0, 0);
+      current = aligned;
+    }
+  }
+
+  return out;
 }
 
 export default async function handler(
@@ -155,7 +254,6 @@ export default async function handler(
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    // 1) Verify client identity
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: "Missing auth token" });
@@ -168,24 +266,18 @@ export default async function handler(
       return res.status(403).json({ error: "Only clients can match providers." });
     }
 
-    // 2) Body
     const { jobId = "" } = req.body || {};
     const jobRequestId = String(jobId).trim();
     if (!jobRequestId) return res.status(400).json({ error: "Missing jobId." });
 
     const db = admin.firestore();
 
-    // 3) Load jobRequest
     const jobRef = db.collection("jobRequest").doc(jobRequestId);
     const jobSnap = await jobRef.get();
     if (!jobSnap.exists) return res.status(404).json({ error: "Job request not found." });
 
     const job = jobSnap.data() as any;
 
-    const isNow = Boolean(job.isNow);
-    const scheduledDate = job.scheduledDate as admin.firestore.Timestamp | undefined;
-
-    // Prefer categoryNormalized if you have it, else fallback to category
     const category = normalizeCategory(job.categoryNormalized ?? job.category);
     if (!category) return res.status(400).json({ error: "Job request missing category/categoryNormalized." });
 
@@ -194,10 +286,9 @@ export default async function handler(
 
     const tasks = Array.isArray(job.tasks) ? job.tasks : [];
 
-    // 4) Compute window (startAt + duration + buffers)
-    const startAt: admin.firestore.Timestamp = isNow
-      ? admin.firestore.Timestamp.now()
-      : scheduledDate ?? admin.firestore.Timestamp.now();
+    // time window for ONE occurrence
+    const startAtBase: admin.firestore.Timestamp =
+      (job.scheduledDate as admin.firestore.Timestamp | undefined) ?? admin.firestore.Timestamp.now();
 
     const labels = tasks
       .map((t: any) => String(t?.label ?? "").trim())
@@ -209,25 +300,53 @@ export default async function handler(
     const bufferBeforeMins = 60;
     const bufferAfterMins = 60;
 
-    const endAt = addMinutes(startAt, totalDurationMins);
-    const blockStartAt = addMinutes(startAt, -bufferBeforeMins);
-    const blockEndAt = addMinutes(endAt, bufferAfterMins);
+    const isRecurring = Boolean(job.isRecurring);
+    const recurrence = job.recurrence ?? {};
+    const preferredDay = recurrence.preferredDay ?? recurrence.day ?? null;
+    const frequency = recurrence.frequency ?? recurrence.interval ?? "1 week";
+    const horizon = Number(recurrence.horizonCount ?? 6);
+    const occCount = Number.isFinite(horizon) ? Math.min(Math.max(horizon, 2), 12) : 6;
 
-    // 5) Query providers by category
+    // ✅ occurrences for recurring; otherwise single occurrence only
+    const occurrenceStarts = isRecurring
+      ? computeOccurrences({
+          startAt: startAtBase,
+          preferredDay,
+          frequency,
+          count: occCount,
+        })
+      : [startAtBase];
+
+    // Build all requested block windows for overlap check
+    const requestedWindows = occurrenceStarts.map((occStart) => {
+      const endAt = addMinutes(occStart, totalDurationMins);
+      const blockStartAt = addMinutes(occStart, -bufferBeforeMins);
+      const blockEndAt = addMinutes(endAt, bufferAfterMins);
+      return { occStart, endAt, blockStartAt, blockEndAt };
+    });
+
+    // Query providers by category
     const providerSnap = await db
       .collection("serviceProviders")
       .where("categoriesNormalized", "array-contains", category)
       .get();
 
-    // 6) Filter by availability
     const availableProviders: any[] = [];
 
     for (const doc of providerSnap.docs) {
       const p = doc.data() as any;
       const providerUid = String(p.providerUid ?? doc.id);
 
-      const hasOverlap = await providerHasOverlap(providerUid, blockStartAt, blockEndAt);
-      if (hasOverlap) continue;
+      // ✅ must be available for ALL requested windows
+      let overlapsAny = false;
+      for (const w of requestedWindows) {
+        const hasOverlap = await providerHasOverlap(providerUid, w.blockStartAt, w.blockEndAt);
+        if (hasOverlap) {
+          overlapsAny = true;
+          break;
+        }
+      }
+      if (overlapsAny) continue;
 
       const gp = p.location as admin.firestore.GeoPoint | undefined;
 
@@ -236,7 +355,6 @@ export default async function handler(
         firstName: p.firstName ?? null,
         lastName: p.lastName ?? null,
         languages: Array.isArray(p.languages) ? p.languages : [],
-        // ✅ JSON-friendly location
         location: gp ? { lat: gp.latitude, lng: gp.longitude } : null,
       });
     }
@@ -249,17 +367,23 @@ export default async function handler(
     return res.status(200).json({
       ok: true,
       jobId: jobRequestId,
-
+      isRecurring,
       jobLocation: jobLocationJson,
 
-      startAt: startAt.toDate().toISOString(),
-      endAt: endAt.toDate().toISOString(),
-      blockStartAt: blockStartAt.toDate().toISOString(),
-      blockEndAt: blockEndAt.toDate().toISOString(),
+      // return the first occurrence window (UI only needs distance + list)
+      startAt: requestedWindows[0].occStart.toDate().toISOString(),
+      endAt: requestedWindows[0].endAt.toDate().toISOString(),
+      blockStartAt: requestedWindows[0].blockStartAt.toDate().toISOString(),
+      blockEndAt: requestedWindows[0].blockEndAt.toDate().toISOString(),
 
       totalDurationMins,
       bufferBeforeMins,
       bufferAfterMins,
+
+      occurrences: requestedWindows.map((w) => ({
+        startAt: w.occStart.toDate().toISOString(),
+        endAt: w.endAt.toDate().toISOString(),
+      })),
 
       providers: availableProviders,
     });
