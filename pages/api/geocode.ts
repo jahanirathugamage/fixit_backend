@@ -26,9 +26,8 @@ export default async function handler(
 
     return res.status(200).json(result);
   } catch (e: unknown) {
-    return res.status(500).json({
-      error: "Server error",
-      details: e instanceof Error ? e.message : String(e),
-    });
+    // IMPORTANT: return JSON so we can see the real reason
+    const details = e instanceof Error ? e.message : String(e);
+    return res.status(500).json({ error: "Server error", details });
   }
 }
