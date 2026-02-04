@@ -5,16 +5,39 @@ export type GeocodeResult = {
   displayName?: string;
 };
 
-type NominatimItem = {
-  lat?: string;
-  lon?: string;
-  display_name?: string;
+type PhotonProperties = {
+  name?: string;
+  city?: string;
+  country?: string;
 };
 
-function isNominatimArray(data: unknown): data is NominatimItem[] {
-  return Array.isArray(data);
+type PhotonGeometry = {
+  coordinates?: [number, number]; // [lon, lat]
+};
+
+type PhotonFeature = {
+  geometry?: PhotonGeometry;
+  properties?: PhotonProperties;
+};
+
+type PhotonResponse = {
+  features?: PhotonFeature[];
+};
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
+function isPhotonResponse(value: unknown): value is PhotonResponse {
+  if (!isObject(value)) return false;
+
+  const features = value["features"];
+  if (features === undefined) return true; // allow missing features
+
+  return Array.isArray(features);
+}
+
+// Keeping function name for compatibility with your existing import/calls
 export async function geocodeWithNominatim(
   address: string,
   opts?: { userAgent?: string; referer?: string }
@@ -22,14 +45,8 @@ export async function geocodeWithNominatim(
   const query = address.trim();
   if (!query) return null;
 
-  // Sri Lanka only (lk)
-  const url =
-    `https://nominatim.openstreetmap.org/search` +
-    `?format=json` +
-    `&addressdetails=1` +
-    `&countrycodes=lk` +
-    `&limit=1` +
-    `&q=${encodeURIComponent(query)}`;
+  // Photon API (no key)
+  const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=1`;
 
   const userAgent =
     opts?.userAgent ?? "FixIt/1.0 (contact: your-email@example.com)";
@@ -41,41 +58,34 @@ export async function geocodeWithNominatim(
   };
   if (referer) headers.Referer = referer;
 
-  // ✅ avoid hanging requests (Vercel can abort long requests)
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
 
   try {
-    const res = await fetch(url, {
-      headers,
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(
-        `Nominatim failed: ${res.status} ${res.statusText} ${body}`
-      );
-    }
+    const res = await fetch(url, { headers, signal: controller.signal });
+    if (!res.ok) return null;
 
     const raw: unknown = await res.json();
-    if (!isNominatimArray(raw) || raw.length === 0) return null;
+    if (!isPhotonResponse(raw)) return null;
 
-    const first = raw[0];
-    const lat = Number(first.lat);
-    const lon = Number(first.lon);
+    const features = raw.features ?? [];
+    if (!features.length) return null;
 
+    const first = features[0];
+    const coords = first.geometry?.coordinates;
+    if (!coords || coords.length !== 2) return null;
+
+    const lon = Number(coords[0]);
+    const lat = Number(coords[1]);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
 
-    return {
-      lat,
-      lon,
-      displayName: first.display_name,
-    };
-  } catch (e: unknown) {
-    // Make the error readable in your API response
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(msg);
+    const name = first.properties?.name ?? "";
+    const city = first.properties?.city ?? "";
+    const country = first.properties?.country ?? "";
+    const displayName =
+      [name, city, country].filter(Boolean).join(", ") || undefined;
+
+    return { lat, lon, displayName };
   } finally {
     clearTimeout(timeout);
   }
