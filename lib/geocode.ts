@@ -24,7 +24,6 @@ export async function geocodeWithNominatim(
 
   // Sri Lanka only (lk)
   const url =
-    `https` +
     `https://nominatim.openstreetmap.org/search` +
     `?format=json` +
     `&addressdetails=1` +
@@ -32,9 +31,6 @@ export async function geocodeWithNominatim(
     `&limit=1` +
     `&q=${encodeURIComponent(query)}`;
 
-  // IMPORTANT:
-  // Nominatim requires a valid User-Agent (and ideally a contact email).
-  // Vercel can also benefit from a Referer header for identification.
   const userAgent =
     opts?.userAgent ?? "FixIt/1.0 (contact: your-email@example.com)";
   const referer = opts?.referer;
@@ -43,29 +39,44 @@ export async function geocodeWithNominatim(
     "User-Agent": userAgent,
     Accept: "application/json",
   };
-
   if (referer) headers.Referer = referer;
 
-  const res = await fetch(url, { headers });
+  // ✅ avoid hanging requests (Vercel can abort long requests)
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Nominatim failed: ${res.status} ${res.statusText} ${body}`);
+  try {
+    const res = await fetch(url, {
+      headers,
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(
+        `Nominatim failed: ${res.status} ${res.statusText} ${body}`
+      );
+    }
+
+    const raw: unknown = await res.json();
+    if (!isNominatimArray(raw) || raw.length === 0) return null;
+
+    const first = raw[0];
+    const lat = Number(first.lat);
+    const lon = Number(first.lon);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+
+    return {
+      lat,
+      lon,
+      displayName: first.display_name,
+    };
+  } catch (e: unknown) {
+    // Make the error readable in your API response
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(msg);
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const raw: unknown = await res.json();
-
-  if (!isNominatimArray(raw) || raw.length === 0) return null;
-
-  const first = raw[0];
-  const lat = Number(first.lat);
-  const lon = Number(first.lon);
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-
-  return {
-    lat,
-    lon,
-    displayName: first.display_name,
-  };
 }
