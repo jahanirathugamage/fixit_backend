@@ -5,15 +5,27 @@ export type GeocodeResult = {
   displayName?: string;
 };
 
-export async function geocodeWithNominatim(address: string): Promise<GeocodeResult | null> {
+type NominatimItem = {
+  lat?: string;
+  lon?: string;
+  display_name?: string;
+};
+
+export async function geocodeWithNominatim(
+  address: string,
+): Promise<GeocodeResult | null> {
   const query = address.trim();
   if (!query) return null;
 
+  // Sri Lanka only (lk)
   const url =
     `https://nominatim.openstreetmap.org/search` +
-    `?format=json&limit=1&addressdetails=1&q=${encodeURIComponent(query)}`;
+    `?format=json` +
+    `&addressdetails=1` +
+    `&countrycodes=lk` +
+    `&limit=1` +
+    `&q=${encodeURIComponent(query)}`;
 
-  // Nominatim requires a valid User-Agent (and ideally contact info)
   const res = await fetch(url, {
     headers: {
       "User-Agent": "FixIt/1.0 (contact: your-email@example.com)",
@@ -23,10 +35,11 @@ export async function geocodeWithNominatim(address: string): Promise<GeocodeResu
 
   if (!res.ok) return null;
 
-  const data = (await res.json()) as Array<any>;
-  if (!data.length) return null;
+  const raw: unknown = await res.json();
+  if (!Array.isArray(raw) || raw.length === 0) return null;
 
-  const first = data[0];
+  const first = raw[0] as NominatimItem;
+
   const lat = Number(first.lat);
   const lon = Number(first.lon);
 
