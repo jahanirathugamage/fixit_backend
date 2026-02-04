@@ -6,60 +6,62 @@ export type GeocodeResult = {
 };
 
 type NominatimItem = {
-  lat?: string | number;
-  lon?: string | number;
+  lat?: string;
+  lon?: string;
   display_name?: string;
 };
 
-function toNumber(value: unknown): number | null {
-  const n = typeof value === "string" || typeof value === "number" ? Number(value) : NaN;
-  return Number.isFinite(n) ? n : null;
+function isNominatimArray(data: unknown): data is NominatimItem[] {
+  return Array.isArray(data);
 }
 
-export async function geocodeWithNominatim(address: string): Promise<GeocodeResult | null> {
+export async function geocodeWithNominatim(
+  address: string,
+  opts?: { userAgent?: string; referer?: string }
+): Promise<GeocodeResult | null> {
   const query = address.trim();
   if (!query) return null;
 
   // Sri Lanka only (lk)
   const url =
+    `https` +
     `https://nominatim.openstreetmap.org/search` +
     `?format=json` +
     `&addressdetails=1` +
     `&countrycodes=lk` +
-    `&limit=5` +
+    `&limit=1` +
     `&q=${encodeURIComponent(query)}`;
 
-  // ✅ Nominatim requires an identifying User-Agent (and ideally a Referer)
-  // Put real values here (or set env vars on Vercel).
+  // IMPORTANT:
+  // Nominatim requires a valid User-Agent (and ideally a contact email).
+  // Vercel can also benefit from a Referer header for identification.
   const userAgent =
-    process.env.NOMINATIM_USER_AGENT ??
-    "FixIt/1.0 (contact: fixit-app@example.com)";
+    opts?.userAgent ?? "FixIt/1.0 (contact: your-email@example.com)";
+  const referer = opts?.referer;
 
-  const referer =
-    process.env.NOMINATIM_REFERER ??
-    "https://fixit-backend.vercel.app";
+  const headers: Record<string, string> = {
+    "User-Agent": userAgent,
+    Accept: "application/json",
+  };
 
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": userAgent,
-      "Referer": referer,
-      "Accept": "application/json",
-    },
-  });
+  if (referer) headers.Referer = referer;
+
+  const res = await fetch(url, { headers });
 
   if (!res.ok) {
-    // Return null so your API route can send a clean error
-    return null;
+    const body = await res.text().catch(() => "");
+    throw new Error(`Nominatim failed: ${res.status} ${res.statusText} ${body}`);
   }
 
   const raw: unknown = await res.json();
-  if (!Array.isArray(raw) || raw.length === 0) return null;
 
-  const first = raw[0] as NominatimItem;
+  if (!isNominatimArray(raw) || raw.length === 0) return null;
 
-  const lat = toNumber(first.lat);
-  const lon = toNumber(first.lon);
-  if (lat === null || lon === null) return null;
+  const first = raw[0];
+  const lat = Number(first.lat);
+  const lon = Number(first.lon);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
 
   return {
     lat,
