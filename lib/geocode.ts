@@ -6,65 +6,64 @@ export type GeocodeResult = {
 };
 
 type NominatimItem = {
-  lat?: string;
-  lon?: string;
+  lat?: string | number;
+  lon?: string | number;
   display_name?: string;
 };
 
-export async function geocodeWithNominatim(
-  address: string,
-): Promise<GeocodeResult | null> {
+function toNumber(value: unknown): number | null {
+  const n = typeof value === "string" || typeof value === "number" ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+export async function geocodeWithNominatim(address: string): Promise<GeocodeResult | null> {
   const query = address.trim();
   if (!query) return null;
 
-  const params = new URLSearchParams({
-    format: "json",
-    addressdetails: "1",
-    countrycodes: "lk",
-    limit: "1",
-    q: query,
+  // Sri Lanka only (lk)
+  const url =
+    `https://nominatim.openstreetmap.org/search` +
+    `?format=json` +
+    `&addressdetails=1` +
+    `&countrycodes=lk` +
+    `&limit=5` +
+    `&q=${encodeURIComponent(query)}`;
+
+  // ✅ Nominatim requires an identifying User-Agent (and ideally a Referer)
+  // Put real values here (or set env vars on Vercel).
+  const userAgent =
+    process.env.NOMINATIM_USER_AGENT ??
+    "FixIt/1.0 (contact: fixit-app@example.com)";
+
+  const referer =
+    process.env.NOMINATIM_REFERER ??
+    "https://fixit-backend.vercel.app";
+
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": userAgent,
+      "Referer": referer,
+      "Accept": "application/json",
+    },
   });
 
-  const url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
-
-  // Timeout (8s)
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 8000);
-
-  try {
-    const res = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-      headers: {
-        // Nominatim policy: identify your app. Replace with your real email if possible.
-        "User-Agent": "FixIt/1.0 (contact: your-email@example.com)",
-        "Referer": "https://fixit-backend.vercel.app",
-        "Accept": "application/json",
-        "Accept-Language": "en",
-      },
-    });
-
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      // Throwing helps us see the reason in API route error response
-      throw new Error(`Nominatim failed: ${res.status} ${res.statusText} ${body}`.trim());
-    }
-
-    const raw: unknown = await res.json();
-    if (!Array.isArray(raw) || raw.length === 0) return null;
-
-    const first = raw[0] as NominatimItem;
-    const lat = Number(first.lat);
-    const lon = Number(first.lon);
-
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-
-    return {
-      lat,
-      lon,
-      displayName: first.display_name,
-    };
-  } finally {
-    clearTimeout(t);
+  if (!res.ok) {
+    // Return null so your API route can send a clean error
+    return null;
   }
+
+  const raw: unknown = await res.json();
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+
+  const first = raw[0] as NominatimItem;
+
+  const lat = toNumber(first.lat);
+  const lon = toNumber(first.lon);
+  if (lat === null || lon === null) return null;
+
+  return {
+    lat,
+    lon,
+    displayName: first.display_name,
+  };
 }
