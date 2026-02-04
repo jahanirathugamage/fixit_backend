@@ -2,9 +2,8 @@
   "name": "fixit_backend",
   "version": "0.1.0",
   "private": true,
-
   "engines": {
-    "node": "18.x"
+    "node": "24.x"
   },
   "scripts": {
     "dev": "next dev",
