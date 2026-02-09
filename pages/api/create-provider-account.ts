@@ -4,7 +4,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
 
-const MIRROR_VERSION = "vercel-create-provider-v2-mirror-skills-and-profile";
+const MIRROR_VERSION = "vercel-create-provider-v3-debug-readback";
 
 function normalizeAddress(input: string): string {
   const raw = String(input || "").trim();
@@ -59,6 +59,15 @@ function sanitizeStringArray(raw: any): string[] {
   return deduped;
 }
 
+/**
+ * Keep skills structure EXACTLY (Flutter expects skills[0].education/certifications/jobExperience).
+ * We only ensure it’s an array of objects.
+ */
+function sanitizeSkills(raw: any): any[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((x) => x && typeof x === "object").map((x) => x);
+}
+
 function parsePinnedLocation(raw: any): Geo | null {
   if (!raw || typeof raw !== "object") return null;
 
@@ -70,15 +79,6 @@ function parsePinnedLocation(raw: any): Geo | null {
   if (lng < -180 || lng > 180) return null;
 
   return { lat, lng };
-}
-
-/**
- * Keep skills structure EXACTLY (Flutter expects skills[0].education/certifications/jobExperience).
- * We only ensure it’s an array of objects.
- */
-function sanitizeSkills(raw: any): any[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter((x) => x && typeof x === "object").map((x) => x);
 }
 
 async function geocodeAddress(
@@ -154,6 +154,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const FieldValue = admin.firestore.FieldValue;
 
   try {
+    // Debug: which Firebase project is this Admin app connected to?
+    const projectId =
+      (admin.app().options as any)?.projectId ||
+      process.env.GCLOUD_PROJECT ||
+      process.env.FIREBASE_PROJECT_ID ||
+      null;
+
     // 1) Verify contractor identity
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -208,15 +215,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       .doc(providerId);
 
     const contractorProviderSnap = await contractorProviderRef.get();
+    const contractorDocExists = contractorProviderSnap.exists;
+
     const contractorProviderData = contractorProviderSnap.exists
       ? (contractorProviderSnap.data() as Record<string, any>)
       : {};
 
-    // Use contractor doc values if present (avoid mismatches)
-    const fName =
-      String(contractorProviderData?.firstName ?? "").trim() || fNameReq;
-    const lName =
-      String(contractorProviderData?.lastName ?? "").trim() || lNameReq;
+    const fName = String(contractorProviderData?.firstName ?? "").trim() || fNameReq;
+    const lName = String(contractorProviderData?.lastName ?? "").trim() || lNameReq;
 
     const fullAddress =
       String(contractorProviderData?.fullAddress ?? "").trim() ||
@@ -228,8 +234,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const city = String(contractorProviderData?.city ?? "").trim();
     const phone = String(contractorProviderData?.phone ?? "").trim();
     const gender = String(contractorProviderData?.gender ?? "").trim();
-    const profileImageBase64 =
-      contractorProviderData?.profileImageBase64 ?? null;
+    const profileImageBase64 = contractorProviderData?.profileImageBase64 ?? null;
 
     const finalCategories =
       sanitizeStringArray(contractorProviderData?.categories).length > 0
@@ -246,13 +251,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         ? sanitizeStringArray(contractorProviderData?.languages)
         : sanitizeStringArray(reqLangs);
 
-    // ✅ skills from contractor doc if present
     const finalSkills =
       Array.isArray(contractorProviderData?.skills) && contractorProviderData.skills.length > 0
         ? sanitizeSkills(contractorProviderData.skills)
         : reqSkills;
 
-    const skillsCount = Array.isArray(finalSkills) ? finalSkills.length : 0;
+    const skillsCountReadFromSource = Array.isArray(finalSkills) ? finalSkills.length : 0;
 
     // 4) Create Auth user
     const userRecord = await admin.auth().createUser({
@@ -278,24 +282,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       { merge: true },
     );
 
-    // 6) Geo (pin > nominatim) - keep existing contractor data if it already has location
+    // 6) Geo (prefer existing contractor location)
     const geoFields: Record<string, any> = {};
     let geo: Geo | null = null;
 
     const contractorHasGeoPoint =
       contractorProviderData?.location &&
       typeof contractorProviderData.location === "object" &&
-      contractorProviderData.location.latitude != null &&
-      contractorProviderData.location.longitude != null;
+      (contractorProviderData.location as any).latitude != null &&
+      (contractorProviderData.location as any).longitude != null;
 
     if (contractorHasGeoPoint) {
-      // If contractor doc already has GeoPoint (from pinned map in Flutter), preserve it.
       geoFields.location = contractorProviderData.location;
       geoFields.locationUpdatedAt =
         contractorProviderData.locationUpdatedAt ?? FieldValue.serverTimestamp();
-      if (contractorProviderData.geocode) {
-        geoFields.geocode = contractorProviderData.geocode;
-      }
+      if (contractorProviderData.geocode) geoFields.geocode = contractorProviderData.geocode;
     } else {
       const pinned = parsePinnedLocation(location);
 
@@ -335,7 +336,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
-    // 7) Update contractor subdoc (ensure providerUid + categories + languages + skills exist)
+    // 7) Update contractor subdoc
     await contractorProviderRef.set(
       {
         providerUid,
@@ -343,7 +344,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         firstName: fName,
         lastName: lName,
 
-        // keep both (your DB already has fullAddress + address)
         fullAddress: fullAddress || "",
         address: fullAddress || "",
 
@@ -353,7 +353,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
         phone: phone || undefined,
         gender: gender || undefined,
-
         profileImageBase64: profileImageBase64 ?? null,
 
         languages: finalLangs,
@@ -371,8 +370,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       { merge: true },
     );
 
-    // 8) ✅ Mirror into serviceProviders/{providerUid}
-    await admin.firestore().collection("serviceProviders").doc(providerUid).set(
+    // 8) Mirror into serviceProviders/{providerUid}
+    const spRef = admin.firestore().collection("serviceProviders").doc(providerUid);
+
+    await spRef.set(
       {
         providerUid,
         providerEmail: mail,
@@ -393,26 +394,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         },
 
         languages: finalLangs,
-
         categories: finalCategories,
         categoriesNormalized: finalCategoriesNormalized,
 
-        // ✅ KEY: education/certs/jobExperience are inside skills
+        // ✅ critical
         skills: finalSkills,
 
-        // ✅ Proof this code ran + for debugging
         mirrorVersion: MIRROR_VERSION,
         mirroredFromProviderDocId: providerId,
-        skillsCount,
+        skillsCount: skillsCountReadFromSource,
+        mirroredAt: FieldValue.serverTimestamp(),
 
         profileImageBase64: profileImageBase64 ?? null,
 
         ...geoFields,
-        createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
+
+    // ✅ Read-back verification (proves what was actually written + which project)
+    const spSnap = await spRef.get();
+    const spData = spSnap.data() || {};
+    const skillsCountInServiceProviders =
+      Array.isArray(spData.skills) ? spData.skills.length : 0;
 
     // 9) Email
     const subject = "Your FixIt provider account";
@@ -431,7 +436,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       ok: true,
       providerUid,
       mirrorVersion: MIRROR_VERSION,
-      skillsCount,
+
+      // ✅ debug truth
+      projectId,
+      contractorUid: callerUid,
+      contractorDocExists,
+      providerDocId: providerId,
+      skillsCountReadFromSource,
+      skillsCountInServiceProviders,
+      serviceProvidersDocExists: spSnap.exists,
     });
   } catch (err: any) {
     console.error("create-provider-account error:", err);
