@@ -4,7 +4,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
 
-const MIRROR_VERSION = "vercel-create-provider-v2-mirror-skills-and-profile";
+const MIRROR_VERSION = "create-provider-account-v7-mirror-skills-debug";
 
 function normalizeAddress(input: string): string {
   const raw = String(input || "").trim();
@@ -72,10 +72,6 @@ function parsePinnedLocation(raw: any): Geo | null {
   return { lat, lng };
 }
 
-/**
- * Keep skills structure EXACTLY (Flutter expects skills[0].education/certifications/jobExperience).
- * We only ensure it’s an array of objects.
- */
 function sanitizeSkills(raw: any): any[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter((x) => x && typeof x === "object").map((x) => x);
@@ -103,7 +99,10 @@ async function geocodeAddress(
       },
     });
 
-    if (!resp.ok) return [] as Array<{ lat: string; lon: string; display_name?: string }>;
+    if (!resp.ok) {
+      console.error(`Nominatim HTTP ${resp.status}`);
+      return [] as Array<{ lat: string; lon: string; display_name?: string }>;
+    }
 
     const data = (await resp.json()) as Array<{
       lat: string;
@@ -140,7 +139,8 @@ async function geocodeAddress(
         displayName: data[0].display_name ?? null,
       },
     };
-  } catch {
+  } catch (e) {
+    console.error("Nominatim fetch failed:", e);
     return null;
   }
 }
@@ -149,7 +149,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   setCors(res);
 
   if (req.method === "OPTIONS") return res.status(204).send("");
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   const FieldValue = admin.firestore.FieldValue;
 
@@ -186,20 +188,25 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const mail = String(email).trim().toLowerCase();
     const pw = String(password).trim();
-    const fNameReq = String(firstName).trim();
-    const lNameReq = String(lastName).trim();
+    const fName = String(firstName).trim();
+    const lName = String(lastName).trim();
     const providerId = String(providerDocId).trim();
-    const fullAddressFromReq = normalizeAddress(address).trim();
+    const fullAddress = normalizeAddress(address).trim();
 
-    const reqLangs = Array.isArray(languages) ? languages : [];
+    const langs = Array.isArray(languages) ? languages : [];
     const reqSkills = sanitizeSkills(skills);
 
-    if (!mail || !mail.includes("@")) return res.status(400).json({ error: "Invalid email." });
-    if (!pw || pw.length < 6)
+    if (!mail || !mail.includes("@")) {
+      return res.status(400).json({ error: "Invalid email." });
+    }
+    if (!pw || pw.length < 6) {
       return res.status(400).json({ error: "Password must be at least 6 characters." });
-    if (!providerId) return res.status(400).json({ error: "Missing providerDocId." });
+    }
+    if (!providerId) {
+      return res.status(400).json({ error: "Missing providerDocId." });
+    }
 
-    // 3) Read contractor provider subdoc (SOURCE OF TRUTH)
+    // 3) Read contractor provider subdoc (source of truth)
     const contractorProviderRef = admin
       .firestore()
       .collection("contractors")
@@ -212,25 +219,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       ? (contractorProviderSnap.data() as Record<string, any>)
       : {};
 
-    // Use contractor doc values if present (avoid mismatches)
-    const fName =
-      String(contractorProviderData?.firstName ?? "").trim() || fNameReq;
-    const lName =
-      String(contractorProviderData?.lastName ?? "").trim() || lNameReq;
-
-    const fullAddress =
-      String(contractorProviderData?.fullAddress ?? "").trim() ||
-      String(contractorProviderData?.address ?? "").trim() ||
-      fullAddressFromReq;
-
-    const address1 = String(contractorProviderData?.address1 ?? "").trim();
-    const address2 = String(contractorProviderData?.address2 ?? "").trim();
-    const city = String(contractorProviderData?.city ?? "").trim();
-    const phone = String(contractorProviderData?.phone ?? "").trim();
-    const gender = String(contractorProviderData?.gender ?? "").trim();
-    const profileImageBase64 =
-      contractorProviderData?.profileImageBase64 ?? null;
-
     const finalCategories =
       sanitizeStringArray(contractorProviderData?.categories).length > 0
         ? sanitizeStringArray(contractorProviderData?.categories)
@@ -241,12 +229,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         ? sanitizeStringArray(contractorProviderData?.categoriesNormalized)
         : sanitizeStringArray(categoriesNormalized);
 
-    const finalLangs =
-      sanitizeStringArray(contractorProviderData?.languages).length > 0
-        ? sanitizeStringArray(contractorProviderData?.languages)
-        : sanitizeStringArray(reqLangs);
-
-    // ✅ skills from contractor doc if present
     const finalSkills =
       Array.isArray(contractorProviderData?.skills) && contractorProviderData.skills.length > 0
         ? sanitizeSkills(contractorProviderData.skills)
@@ -264,7 +246,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const providerUid = userRecord.uid;
     const contractorRef = admin.firestore().doc(`contractors/${callerUid}`);
 
-    // 5) Create/merge users/{providerUid}
+    // 5) users/{providerUid}
     await admin.firestore().collection("users").doc(providerUid).set(
       {
         role: "provider",
@@ -278,137 +260,90 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       { merge: true },
     );
 
-    // 6) Geo (pin > nominatim) - keep existing contractor data if it already has location
-    const geoFields: Record<string, any> = {};
+    // 6) Geo
+    const pinned = parsePinnedLocation(location);
+
     let geo: Geo | null = null;
+    const geoFields: Record<string, any> = {};
 
-    const contractorHasGeoPoint =
-      contractorProviderData?.location &&
-      typeof contractorProviderData.location === "object" &&
-      contractorProviderData.location.latitude != null &&
-      contractorProviderData.location.longitude != null;
-
-    if (contractorHasGeoPoint) {
-      // If contractor doc already has GeoPoint (from pinned map in Flutter), preserve it.
-      geoFields.location = contractorProviderData.location;
-      geoFields.locationUpdatedAt =
-        contractorProviderData.locationUpdatedAt ?? FieldValue.serverTimestamp();
-      if (contractorProviderData.geocode) {
-        geoFields.geocode = contractorProviderData.geocode;
-      }
+    if (pinned) {
+      geo = pinned;
+      geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
+      geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
+      geoFields.geocode = {
+        source: "pin",
+        query: fullAddress || "",
+        displayName: null,
+        status: "pin",
+        updatedAt: FieldValue.serverTimestamp(),
+      } satisfies GeocodeMeta;
     } else {
-      const pinned = parsePinnedLocation(location);
+      geoFields.geocode = {
+        source: "nominatim",
+        query: fullAddress || "",
+        displayName: null,
+        status: "no_results",
+        updatedAt: FieldValue.serverTimestamp(),
+      } satisfies GeocodeMeta;
 
-      if (pinned) {
-        geo = pinned;
+      const geocoded = await geocodeAddress(fullAddress);
+      if (geocoded) {
+        geo = geocoded.geo;
         geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
         geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
         geoFields.geocode = {
-          source: "pin",
-          query: fullAddress || "",
-          displayName: null,
-          status: "pin",
-          updatedAt: FieldValue.serverTimestamp(),
-        } satisfies GeocodeMeta;
-      } else {
-        geoFields.geocode = {
           source: "nominatim",
-          query: fullAddress || "",
-          displayName: null,
-          status: "no_results",
+          query: geocoded.meta.query,
+          displayName: geocoded.meta.displayName ?? null,
+          status: "ok",
           updatedAt: FieldValue.serverTimestamp(),
         } satisfies GeocodeMeta;
-
-        const geocoded = await geocodeAddress(fullAddress);
-        if (geocoded) {
-          geo = geocoded.geo;
-          geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
-          geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
-          geoFields.geocode = {
-            source: "nominatim",
-            query: geocoded.meta.query,
-            displayName: geocoded.meta.displayName ?? null,
-            status: "ok",
-            updatedAt: FieldValue.serverTimestamp(),
-          } satisfies GeocodeMeta;
-        }
       }
     }
 
-    // 7) Update contractor subdoc (ensure providerUid + categories + languages + skills exist)
+    // 7) Update contractor subdoc
     await contractorProviderRef.set(
       {
         providerUid,
         email: mail,
         firstName: fName,
         lastName: lName,
-
-        // keep both (your DB already has fullAddress + address)
-        fullAddress: fullAddress || "",
         address: fullAddress || "",
-
-        address1: address1 || undefined,
-        address2: address2 || undefined,
-        city: city || undefined,
-
-        phone: phone || undefined,
-        gender: gender || undefined,
-
-        profileImageBase64: profileImageBase64 ?? null,
-
-        languages: finalLangs,
+        languages: langs,
         skills: finalSkills,
-
         managedBy: contractorRef,
         contractorId: callerUid,
         updatedAt: FieldValue.serverTimestamp(),
-
         categories: finalCategories,
         categoriesNormalized: finalCategoriesNormalized,
-
         ...geoFields,
       },
       { merge: true },
     );
 
-    // 8) ✅ Mirror into serviceProviders/{providerUid}
+    // 8) Mirror into serviceProviders/{providerUid}
     await admin.firestore().collection("serviceProviders").doc(providerUid).set(
       {
         providerUid,
         providerEmail: mail,
         managedBy: contractorRef,
         contractorId: callerUid,
-
+        address: { fullAddress: fullAddress || "" },
         firstName: fName,
         lastName: lName,
-
-        phone: phone || undefined,
-        gender: gender || undefined,
-
-        address: {
-          fullAddress: fullAddress || "",
-          address1: address1 || undefined,
-          address2: address2 || undefined,
-          city: city || undefined,
-        },
-
-        languages: finalLangs,
-
+        languages: langs,
         categories: finalCategories,
         categoriesNormalized: finalCategoriesNormalized,
 
-        // ✅ KEY: education/certs/jobExperience are inside skills
+        // ✅ mirror skills
         skills: finalSkills,
 
-        // ✅ Proof this code ran + for debugging
+        // ✅ debug proof
         mirrorVersion: MIRROR_VERSION,
         mirroredFromProviderDocId: providerId,
         skillsCount,
 
-        profileImageBase64: profileImageBase64 ?? null,
-
         ...geoFields,
-        createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
@@ -430,8 +365,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(200).json({
       ok: true,
       providerUid,
-      mirrorVersion: MIRROR_VERSION,
+      geo,
       skillsCount,
+      mirrorVersion: MIRROR_VERSION,
     });
   } catch (err: any) {
     console.error("create-provider-account error:", err);
