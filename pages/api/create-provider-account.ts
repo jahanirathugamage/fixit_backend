@@ -4,7 +4,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
 
-const MIRROR_VERSION = "vercel-create-provider-v2-mirror-skills-readback";
+const MIRROR_VERSION = "vercel-create-provider-v3-debug-readback";
 
 function normalizeAddress(input: string): string {
   const raw = String(input || "").trim();
@@ -59,6 +59,15 @@ function sanitizeStringArray(raw: any): string[] {
   return deduped;
 }
 
+/**
+ * Keep skills structure EXACTLY (Flutter expects skills[0].education/certifications/jobExperience).
+ * We only ensure it’s an array of objects.
+ */
+function sanitizeSkills(raw: any): any[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((x) => x && typeof x === "object").map((x) => x);
+}
+
 function parsePinnedLocation(raw: any): Geo | null {
   if (!raw || typeof raw !== "object") return null;
 
@@ -70,15 +79,6 @@ function parsePinnedLocation(raw: any): Geo | null {
   if (lng < -180 || lng > 180) return null;
 
   return { lat, lng };
-}
-
-/**
- * Keep skills structure EXACTLY (Flutter expects skills[0].education/certifications/jobExperience).
- * Only ensure array-of-objects.
- */
-function sanitizeSkills(raw: any): any[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter((x) => x && typeof x === "object").map((x) => x);
 }
 
 async function geocodeAddress(
@@ -135,7 +135,10 @@ async function geocodeAddress(
 
     return {
       geo: { lat, lng },
-      meta: { query, displayName: data[0].display_name ?? null },
+      meta: {
+        query,
+        displayName: data[0].display_name ?? null,
+      },
     };
   } catch {
     return null;
@@ -151,6 +154,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const FieldValue = admin.firestore.FieldValue;
 
   try {
+    // Debug: which Firebase project is this Admin app connected to?
+    const projectId =
+      (admin.app().options as any)?.projectId ||
+      process.env.GCLOUD_PROJECT ||
+      process.env.FIREBASE_PROJECT_ID ||
+      null;
+
     // 1) Verify contractor identity
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -183,12 +193,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const mail = String(email).trim().toLowerCase();
     const pw = String(password).trim();
-    const fName = String(firstName).trim();
-    const lName = String(lastName).trim();
+    const fNameReq = String(firstName).trim();
+    const lNameReq = String(lastName).trim();
     const providerId = String(providerDocId).trim();
-    const fullAddress = normalizeAddress(address).trim();
+    const fullAddressFromReq = normalizeAddress(address).trim();
 
-    const langs = Array.isArray(languages) ? languages : [];
+    const reqLangs = Array.isArray(languages) ? languages : [];
     const reqSkills = sanitizeSkills(skills);
 
     if (!mail || !mail.includes("@")) return res.status(400).json({ error: "Invalid email." });
@@ -205,9 +215,26 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       .doc(providerId);
 
     const contractorProviderSnap = await contractorProviderRef.get();
+    const contractorDocExists = contractorProviderSnap.exists;
+
     const contractorProviderData = contractorProviderSnap.exists
       ? (contractorProviderSnap.data() as Record<string, any>)
       : {};
+
+    const fName = String(contractorProviderData?.firstName ?? "").trim() || fNameReq;
+    const lName = String(contractorProviderData?.lastName ?? "").trim() || lNameReq;
+
+    const fullAddress =
+      String(contractorProviderData?.fullAddress ?? "").trim() ||
+      String(contractorProviderData?.address ?? "").trim() ||
+      fullAddressFromReq;
+
+    const address1 = String(contractorProviderData?.address1 ?? "").trim();
+    const address2 = String(contractorProviderData?.address2 ?? "").trim();
+    const city = String(contractorProviderData?.city ?? "").trim();
+    const phone = String(contractorProviderData?.phone ?? "").trim();
+    const gender = String(contractorProviderData?.gender ?? "").trim();
+    const profileImageBase64 = contractorProviderData?.profileImageBase64 ?? null;
 
     const finalCategories =
       sanitizeStringArray(contractorProviderData?.categories).length > 0
@@ -219,13 +246,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         ? sanitizeStringArray(contractorProviderData?.categoriesNormalized)
         : sanitizeStringArray(categoriesNormalized);
 
-    // ✅ skills from contractor doc if present
+    const finalLangs =
+      sanitizeStringArray(contractorProviderData?.languages).length > 0
+        ? sanitizeStringArray(contractorProviderData?.languages)
+        : sanitizeStringArray(reqLangs);
+
     const finalSkills =
       Array.isArray(contractorProviderData?.skills) && contractorProviderData.skills.length > 0
         ? sanitizeSkills(contractorProviderData.skills)
         : reqSkills;
 
-    const skillsCount = Array.isArray(finalSkills) ? finalSkills.length : 0;
+    const skillsCountReadFromSource = Array.isArray(finalSkills) ? finalSkills.length : 0;
 
     // 4) Create Auth user
     const userRecord = await admin.auth().createUser({
@@ -237,7 +268,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const providerUid = userRecord.uid;
     const contractorRef = admin.firestore().doc(`contractors/${callerUid}`);
 
-    // 5) users/{providerUid}
+    // 5) Create/merge users/{providerUid}
     await admin.firestore().collection("users").doc(providerUid).set(
       {
         role: "provider",
@@ -251,44 +282,57 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       { merge: true },
     );
 
-    // 6) Geo (pin > nominatim)
-    const pinned = parsePinnedLocation(location);
-
-    let geo: Geo | null = null;
+    // 6) Geo (prefer existing contractor location)
     const geoFields: Record<string, any> = {};
+    let geo: Geo | null = null;
 
-    if (pinned) {
-      geo = pinned;
-      geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
-      geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
-      geoFields.geocode = {
-        source: "pin",
-        query: fullAddress || "",
-        displayName: null,
-        status: "pin",
-        updatedAt: FieldValue.serverTimestamp(),
-      } satisfies GeocodeMeta;
+    const contractorHasGeoPoint =
+      contractorProviderData?.location &&
+      typeof contractorProviderData.location === "object" &&
+      (contractorProviderData.location as any).latitude != null &&
+      (contractorProviderData.location as any).longitude != null;
+
+    if (contractorHasGeoPoint) {
+      geoFields.location = contractorProviderData.location;
+      geoFields.locationUpdatedAt =
+        contractorProviderData.locationUpdatedAt ?? FieldValue.serverTimestamp();
+      if (contractorProviderData.geocode) geoFields.geocode = contractorProviderData.geocode;
     } else {
-      geoFields.geocode = {
-        source: "nominatim",
-        query: fullAddress || "",
-        displayName: null,
-        status: "no_results",
-        updatedAt: FieldValue.serverTimestamp(),
-      } satisfies GeocodeMeta;
+      const pinned = parsePinnedLocation(location);
 
-      const geocoded = await geocodeAddress(fullAddress);
-      if (geocoded) {
-        geo = geocoded.geo;
+      if (pinned) {
+        geo = pinned;
         geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
         geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
         geoFields.geocode = {
-          source: "nominatim",
-          query: geocoded.meta.query,
-          displayName: geocoded.meta.displayName ?? null,
-          status: "ok",
+          source: "pin",
+          query: fullAddress || "",
+          displayName: null,
+          status: "pin",
           updatedAt: FieldValue.serverTimestamp(),
         } satisfies GeocodeMeta;
+      } else {
+        geoFields.geocode = {
+          source: "nominatim",
+          query: fullAddress || "",
+          displayName: null,
+          status: "no_results",
+          updatedAt: FieldValue.serverTimestamp(),
+        } satisfies GeocodeMeta;
+
+        const geocoded = await geocodeAddress(fullAddress);
+        if (geocoded) {
+          geo = geocoded.geo;
+          geoFields.location = new admin.firestore.GeoPoint(geo.lat, geo.lng);
+          geoFields.locationUpdatedAt = FieldValue.serverTimestamp();
+          geoFields.geocode = {
+            source: "nominatim",
+            query: geocoded.meta.query,
+            displayName: geocoded.meta.displayName ?? null,
+            status: "ok",
+            updatedAt: FieldValue.serverTimestamp(),
+          } satisfies GeocodeMeta;
+        }
       }
     }
 
@@ -299,14 +343,28 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         email: mail,
         firstName: fName,
         lastName: lName,
+
+        fullAddress: fullAddress || "",
         address: fullAddress || "",
-        languages: langs,
+
+        address1: address1 || undefined,
+        address2: address2 || undefined,
+        city: city || undefined,
+
+        phone: phone || undefined,
+        gender: gender || undefined,
+        profileImageBase64: profileImageBase64 ?? null,
+
+        languages: finalLangs,
         skills: finalSkills,
+
         managedBy: contractorRef,
         contractorId: callerUid,
         updatedAt: FieldValue.serverTimestamp(),
+
         categories: finalCategories,
         categoriesNormalized: finalCategoriesNormalized,
+
         ...geoFields,
       },
       { merge: true },
@@ -322,21 +380,32 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         managedBy: contractorRef,
         contractorId: callerUid,
 
-        address: { fullAddress: fullAddress || "" },
-
         firstName: fName,
         lastName: lName,
-        languages: langs,
 
+        phone: phone || undefined,
+        gender: gender || undefined,
+
+        address: {
+          fullAddress: fullAddress || "",
+          address1: address1 || undefined,
+          address2: address2 || undefined,
+          city: city || undefined,
+        },
+
+        languages: finalLangs,
         categories: finalCategories,
         categoriesNormalized: finalCategoriesNormalized,
 
-        // ✅ the important one
+        // ✅ critical
         skills: finalSkills,
 
         mirrorVersion: MIRROR_VERSION,
         mirroredFromProviderDocId: providerId,
-        skillsCount,
+        skillsCount: skillsCountReadFromSource,
+        mirroredAt: FieldValue.serverTimestamp(),
+
+        profileImageBase64: profileImageBase64 ?? null,
 
         ...geoFields,
         updatedAt: FieldValue.serverTimestamp(),
@@ -344,11 +413,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       { merge: true },
     );
 
-    // ✅ READ BACK what was actually saved (proves deployment + project)
+    // ✅ Read-back verification (proves what was actually written + which project)
     const spSnap = await spRef.get();
     const spData = spSnap.data() || {};
-    const serviceProvidersHasSkills =
-      Array.isArray(spData.skills) && spData.skills.length > 0;
+    const skillsCountInServiceProviders =
+      Array.isArray(spData.skills) ? spData.skills.length : 0;
 
     // 9) Email
     const subject = "Your FixIt provider account";
@@ -367,10 +436,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       ok: true,
       providerUid,
       mirrorVersion: MIRROR_VERSION,
-      skillsCount,
-      serviceProvidersHasSkills,
-      serviceProvidersKeys: Object.keys(spData),
-      projectId: admin.app().options.projectId ?? null,
+
+      // ✅ debug truth
+      projectId,
+      contractorUid: callerUid,
+      contractorDocExists,
+      providerDocId: providerId,
+      skillsCountReadFromSource,
+      skillsCountInServiceProviders,
+      serviceProvidersDocExists: spSnap.exists,
     });
   } catch (err: any) {
     console.error("create-provider-account error:", err);
