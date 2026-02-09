@@ -130,6 +130,32 @@ function asString(v: any): string {
   return String(v ?? "").trim();
 }
 
+function isVercelCron(req: NextApiRequest): boolean {
+  const v = req.headers["x-vercel-cron"];
+  if (typeof v === "string") return v === "1" || v.toLowerCase() === "true";
+  if (Array.isArray(v)) return v.includes("1") || v.some((x) => x.toLowerCase() === "true");
+  return false;
+}
+
+/**
+ * Allow:
+ * - Vercel cron calls (x-vercel-cron: 1)
+ * - Manual/test calls (Authorization Bearer CRON_SECRET OR x-cron-secret)
+ */
+function authorizeCron(req: NextApiRequest): string | null {
+  if (isVercelCron(req)) return null;
+
+  const cronKey = (process.env.CRON_SECRET ?? "").trim();
+  if (!cronKey) return "Unauthorized";
+
+  const xCron = asString(req.headers["x-cron-secret"]);
+  const auth = asString(req.headers.authorization);
+  const match = auth.match(/^Bearer (.+)$/);
+
+  const ok = xCron === cronKey || (match?.[1] ?? "") === cronKey;
+  return ok ? null : "Unauthorized";
+}
+
 /**
  * Generate future jobs only when root is accepted
  */
@@ -145,27 +171,13 @@ export default async function handler(
   if (req.method !== "GET")
     return res.status(405).json({ ok: false, error: "Method not allowed" });
 
+  const authErr = authorizeCron(req);
+  if (authErr) return res.status(401).json({ ok: false, error: authErr });
+
   try {
-    // ✅ Cron protection (supports BOTH header styles)
-    // - vercel.json for generate uses NO headers currently -> so allow if no CRON_SECRET is set
-    // - if CRON_SECRET is set -> accept either:
-    //   1) x-cron-secret: <secret>
-    //   2) Authorization: Bearer <secret>
-    const cronKey = (process.env.CRON_SECRET ?? "").trim();
-    if (cronKey) {
-      const xCron = asString(req.headers["x-cron-secret"]);
-      const auth = asString(req.headers.authorization);
-      const match = auth.match(/^Bearer (.+)$/);
-
-      const ok = xCron === cronKey || (match?.[1] ?? "") === cronKey;
-      if (!ok) {
-        return res.status(401).json({ ok: false, error: "Unauthorized" });
-      }
-    }
-
     const db = admin.firestore();
 
-    // ✅ Fetch ALL recurring jobs, then filter roots in code
+    // Fetch recurring jobs, filter roots in code
     const recurringSnap = await db
       .collection("jobRequest")
       .where("isRecurring", "==", true)
@@ -179,7 +191,7 @@ export default async function handler(
       const root = rootDoc.data() as any;
       const rootId = rootDoc.id;
 
-      // ✅ Only process ROOTS (skip occurrences / child docs)
+      // Only process ROOTS (skip occurrences / child docs)
       const isOccurrence =
         Boolean(root.isRecurringOccurrence) ||
         asString(root.requestType).toLowerCase() === "recurring_occurrence" ||
@@ -191,9 +203,7 @@ export default async function handler(
       scanned++;
 
       const status = asString(root.status).toLowerCase();
-      if (!GENERATE_WHEN_ROOT_STATUS_IN.has(status)) {
-        continue;
-      }
+      if (!GENERATE_WHEN_ROOT_STATUS_IN.has(status)) continue;
 
       const recurrence = root.recurrence ?? {};
       const startAtTs =
@@ -204,7 +214,10 @@ export default async function handler(
 
       const preferredDay = recurrence.preferredDay ?? recurrence.day ?? null;
       const frequency =
-        recurrence.frequency ?? recurrence.frequencyLabel ?? recurrence.interval ?? "1 week";
+        recurrence.frequency ??
+        recurrence.frequencyLabel ??
+        recurrence.interval ??
+        "1 week";
 
       const horizon = Number(recurrence.horizonCount ?? 6);
       const occCount = Number.isFinite(horizon)
@@ -218,10 +231,9 @@ export default async function handler(
         count: occCount,
       });
 
-      // ✅ Series id = existing or root id
       const seriesId = asString(root.recurrenceSeriesId ?? rootId) || rootId;
 
-      // ✅ Existing occurrences in this series
+      // Existing occurrences in this series
       const existingSnap = await db
         .collection("jobRequest")
         .where("recurrenceSeriesId", "==", seriesId)
@@ -233,7 +245,7 @@ export default async function handler(
         if (Number.isFinite(idx) && idx >= 0) existingIndices.add(idx);
       }
 
-      // ✅ Backfill root linkage if missing
+      // Backfill root linkage if missing
       if (!root.recurrenceSeriesId || asString(root.recurrenceSeriesId) !== seriesId) {
         await rootDoc.ref.set(
           {
@@ -265,11 +277,9 @@ export default async function handler(
         const payload: Record<string, any> = {
           jobId: newRef.id,
 
-          // Identity (same client)
           clientId: root.clientId ?? null,
           clientName: root.clientName ?? "Client",
 
-          // Core details copied
           category: root.category ?? "",
           categoryNormalized:
             root.categoryNormalized ?? String(root.category ?? "").trim().toLowerCase(),
@@ -285,18 +295,15 @@ export default async function handler(
 
           pricing: root.pricing ?? {},
 
-          // ✅ Assign same provider
           selectedProviderUid: root.selectedProviderUid ?? "",
           providerName: root.providerName ?? "",
 
-          // ✅ Recurrence linkage
           isRecurring: true,
           isRecurringRequest: true,
           recurrenceSeriesId: seriesId,
           recurrenceIndex: idx,
           recurrence: recurrence,
 
-          // ✅ Future jobs should show as scheduled
           status: "scheduled",
 
           createdAt: admin.firestore.FieldValue.serverTimestamp(),

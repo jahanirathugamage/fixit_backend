@@ -40,38 +40,31 @@ async function sendToUserTopic(params: {
   });
 }
 
-/**
- * Recurring Reminder Rules:
- * 1) Do NOT send reminder for FIRST job in recurrence.
- * 2) For NEXT jobs, send reminder 48 hours before scheduledDate.
- * 3) Notify both client + provider; tap goes to that scheduled job's job details.
- *
- * Vercel Hobby constraint:
- * - Cron can only run ONCE per day, and timing is not exact.
- * - Therefore we widen the "48h" matching window to ensure reminders still send.
- *
- * Daily scan window:
- * - scheduledDate in [48h, 72h] from now (plus drift buffer)
- * - Prevent duplicates using reminder48hSent.
- */
+function isVercelCron(req: NextApiRequest): boolean {
+  const v = req.headers["x-vercel-cron"];
+  if (typeof v === "string") return v === "1" || v.toLowerCase() === "true";
+  if (Array.isArray(v)) return v.includes("1") || v.some((x) => x.toLowerCase() === "true");
+  return false;
+}
 
-// Daily cron window: 48h to 72h ahead
-const WINDOW_START_HOURS = 48;
-const WINDOW_END_HOURS = 72;
+function authorizeCron(req: NextApiRequest): string | null {
+  if (isVercelCron(req)) return null;
 
-// Buffer to tolerate cron drift
-const DRIFT_BUFFER_MINUTES = 90;
-
-function requireCronAuth(req: NextApiRequest): string | null {
   const secret = (process.env.CRON_SECRET ?? "").trim();
-  if (!secret) return null;
+  if (!secret) return "Unauthorized";
 
   const auth = asString(req.headers.authorization).trim();
   const match = auth.match(/^Bearer (.+)$/);
-  if (!match) return "Missing Bearer token";
-  if (match[1] !== secret) return "Invalid token";
-  return null;
+  const xCron = asString(req.headers["x-cron-secret"]).trim();
+
+  const ok = xCron === secret || (match?.[1] ?? "") === secret;
+  return ok ? null : "Unauthorized";
 }
+
+// Daily cron window: 48h to 72h ahead (plus drift buffer)
+const WINDOW_START_HOURS = 48;
+const WINDOW_END_HOURS = 72;
+const DRIFT_BUFFER_MINUTES = 90;
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   setCors(res);
@@ -80,7 +73,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const authErr = requireCronAuth(req);
+  const authErr = authorizeCron(req);
   if (authErr) return res.status(401).json({ error: authErr });
 
   try {
@@ -146,11 +139,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
 
       const status = asString(data["status"]).trim().toLowerCase();
-      if (
-        status.includes("cancel") ||
-        status.includes("terminated") ||
-        status.includes("stopped")
-      ) {
+      if (status.includes("cancel") || status.includes("terminated") || status.includes("stopped")) {
         skippedCancelled++;
         continue;
       }
