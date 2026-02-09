@@ -11,27 +11,6 @@ function setCors(res: NextApiResponse) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
-function sanitizeStringArray(raw: any): string[] {
-  if (!Array.isArray(raw)) return [];
-  const cleaned = raw
-    .map((v) => String(v ?? "").trim())
-    .filter((v) => v.length > 0);
-
-  const deduped: string[] = [];
-  const seen = new Set<string>();
-  for (const v of cleaned) {
-    const key = v.toLowerCase();
-    if (!seen.has(key)) {
-      seen.add(key);
-      deduped.push(v);
-    }
-  }
-  return deduped;
-}
-
-/**
- * Keep skills structure EXACTLY (Flutter expects skills[0].education/certifications/jobExperience).
- */
 function sanitizeSkills(raw: any): any[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter((x) => x && typeof x === "object").map((x) => x);
@@ -46,151 +25,83 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const FieldValue = admin.firestore.FieldValue;
 
   try {
-    // Debug: which Firebase project is Admin connected to?
-    const projectId =
-      (admin.app().options as any)?.projectId ||
-      process.env.GCLOUD_PROJECT ||
-      process.env.FIREBASE_PROJECT_ID ||
-      null;
-
-    // 1) Verify contractor identity
+    // Verify contractor identity
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: "Missing auth token" });
 
     const decoded = await admin.auth().verifyIdToken(idToken);
-    const contractorUid = decoded.uid;
+    const callerUid = decoded.uid;
 
-    const userSnap = await admin.firestore().collection("users").doc(contractorUid).get();
+    const userSnap = await admin.firestore().collection("users").doc(callerUid).get();
     const role = userSnap.exists ? (userSnap.data()?.role as string) : null;
-
     if (role !== "contractor") {
       return res.status(403).json({ error: "Only contractors can mirror provider profiles." });
     }
 
-    // 2) Body
-    const { providerDocId = "" } = req.body || {};
+    const { providerDocId = "", providerUid = "" } = req.body || {};
     const providerId = String(providerDocId).trim();
-    if (!providerId) return res.status(400).json({ error: "Missing providerDocId." });
+    const pUid = String(providerUid).trim();
 
-    // 3) Read contractor provider doc (SOURCE OF TRUTH)
+    if (!providerId) return res.status(400).json({ error: "Missing providerDocId." });
+    if (!pUid) return res.status(400).json({ error: "Missing providerUid." });
+
     const contractorProviderRef = admin
       .firestore()
       .collection("contractors")
-      .doc(contractorUid)
+      .doc(callerUid)
       .collection("providers")
       .doc(providerId);
 
-    const snap = await contractorProviderRef.get();
-    if (!snap.exists) {
-      return res.status(404).json({
-        error: "Contractor provider doc not found.",
-        contractorUid,
-        providerDocId: providerId,
-        projectId,
-      });
+    const contractorProviderSnap = await contractorProviderRef.get();
+    if (!contractorProviderSnap.exists) {
+      return res.status(404).json({ error: "Contractor provider doc not found." });
     }
 
-    const data = (snap.data() || {}) as Record<string, any>;
+    const data = contractorProviderSnap.data() as Record<string, any>;
 
-    const providerUid = String(data.providerUid ?? "").trim();
-    if (!providerUid) {
-      return res.status(400).json({
-        error: "providerUid missing in contractor provider doc. (Account creation may have failed)",
-        contractorUid,
-        providerDocId: providerId,
-        projectId,
-      });
+    const finalSkills =
+      Array.isArray(data.skills) && data.skills.length > 0 ? sanitizeSkills(data.skills) : [];
+    const skillsCount = Array.isArray(finalSkills) ? finalSkills.length : 0;
+
+    // Copy ONLY what clients/providers need
+    const mirrorPayload: Record<string, any> = {
+      providerUid: pUid,
+      contractorId: callerUid,
+      firstName: data.firstName ?? "",
+      lastName: data.lastName ?? "",
+      languages: Array.isArray(data.languages) ? data.languages : [],
+      categories: Array.isArray(data.categories) ? data.categories : [],
+      categoriesNormalized: Array.isArray(data.categoriesNormalized) ? data.categoriesNormalized : [],
+      location: data.location ?? null,
+      locationUpdatedAt: data.locationUpdatedAt ?? null,
+      geocode: data.geocode ?? null,
+
+      // ✅ key fix
+      skills: finalSkills,
+
+      mirrorVersion: MIRROR_VERSION,
+      mirroredFromProviderDocId: providerId,
+      skillsCount,
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    // Optional address format (keep what you already use)
+    if (typeof data.fullAddress === "string") {
+      mirrorPayload.address = { fullAddress: data.fullAddress };
+    } else if (typeof data.address === "string") {
+      mirrorPayload.address = { fullAddress: data.address };
     }
 
-    // 4) Prepare fields to mirror
-    const firstName = String(data.firstName ?? "").trim();
-    const lastName = String(data.lastName ?? "").trim();
-    const email = String(data.email ?? "").trim().toLowerCase();
-    const phone = String(data.phone ?? "").trim();
-    const gender = String(data.gender ?? "").trim();
-
-    const fullAddress =
-      String(data.fullAddress ?? "").trim() || String(data.address ?? "").trim();
-
-    const address1 = String(data.address1 ?? "").trim();
-    const address2 = String(data.address2 ?? "").trim();
-    const city = String(data.city ?? "").trim();
-
-    const languages = sanitizeStringArray(data.languages);
-    const categories = sanitizeStringArray(data.categories);
-    const categoriesNormalized = sanitizeStringArray(data.categoriesNormalized);
-
-    const skills = Array.isArray(data.skills) ? sanitizeSkills(data.skills) : [];
-    const skillsCount = Array.isArray(skills) ? skills.length : 0;
-
-    // Preserve existing GeoPoint and geocode fields if present
-    const geoFields: Record<string, any> = {};
-    if (data.location) geoFields.location = data.location;
-    if (data.locationUpdatedAt) geoFields.locationUpdatedAt = data.locationUpdatedAt;
-    if (data.geocode) geoFields.geocode = data.geocode;
-
-    // Preserve profile image base64 (your app uses it)
-    const profileImageBase64 = data.profileImageBase64 ?? null;
-
-    const contractorRef = admin.firestore().doc(`contractors/${contractorUid}`);
-
-    // 5) Mirror to serviceProviders/{providerUid}
-    const spRef = admin.firestore().collection("serviceProviders").doc(providerUid);
-
-    await spRef.set(
-      {
-        providerUid,
-        providerEmail: email || undefined,
-        managedBy: contractorRef,
-        contractorId: contractorUid,
-
-        firstName,
-        lastName,
-        phone: phone || undefined,
-        gender: gender || undefined,
-
-        address: {
-          fullAddress: fullAddress || "",
-          address1: address1 || undefined,
-          address2: address2 || undefined,
-          city: city || undefined,
-        },
-
-        languages,
-        categories,
-        categoriesNormalized,
-
-        // ✅ THIS is what your UI reads for education/certs/jobExperience
-        skills,
-
-        profileImageBase64,
-
-        mirrorVersion: MIRROR_VERSION,
-        mirroredFromProviderDocId: providerId,
-        skillsCount,
-        mirroredAt: FieldValue.serverTimestamp(),
-
-        ...geoFields,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
-
-    // 6) Read-back proof
-    const spSnap = await spRef.get();
-    const spData = spSnap.data() || {};
-    const skillsCountInServiceProviders = Array.isArray(spData.skills) ? spData.skills.length : 0;
+    await admin.firestore().collection("serviceProviders").doc(pUid).set(mirrorPayload, {
+      merge: true,
+    });
 
     return res.status(200).json({
       ok: true,
-      projectId,
-      contractorUid,
-      providerDocId: providerId,
-      providerUid,
+      providerUid: pUid,
+      skillsCount,
       mirrorVersion: MIRROR_VERSION,
-      skillsCountReadFromContractor: skillsCount,
-      skillsCountInServiceProviders,
     });
   } catch (err: any) {
     console.error("mirror-provider-profile error:", err);
