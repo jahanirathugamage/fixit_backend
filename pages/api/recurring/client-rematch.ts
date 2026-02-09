@@ -1,3 +1,4 @@
+// pages/api/recurring/client-rematch.ts
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -12,6 +13,19 @@ function setCors(res: NextApiResponse) {
 async function getCallerRole(uid: string): Promise<string | null> {
   const snap = await admin.firestore().collection("users").doc(uid).get();
   return snap.exists ? (snap.data()?.role as string) : null;
+}
+
+async function notifyToTopic(topic: string, payload: Record<string, any>) {
+  try {
+    await admin.messaging().send({
+      topic,
+      data: Object.fromEntries(
+        Object.entries(payload).map(([k, v]) => [k, String(v)]),
+      ),
+    });
+  } catch {
+    // best-effort; ignore notification failures
+  }
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -30,7 +44,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const callerUid = decoded.uid;
 
     const role = await getCallerRole(callerUid);
-    if (role !== "client") return res.status(403).json({ error: "Only clients can cancel holds." });
+    if (role !== "client") return res.status(403).json({ error: "Only clients can rematch." });
 
     // 2) Body
     const { jobId = "" } = req.body || {};
@@ -46,7 +60,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const job = jobSnap.data() as any;
 
-    // Ensure the caller owns the job (extra safety)
+    // Ensure the caller owns the job
     const clientId = String(job.clientId ?? "").trim();
     if (!clientId || clientId !== callerUid) {
       return res.status(403).json({ error: "You do not own this job request." });
@@ -55,7 +69,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const providerUid = String(job.selectedProviderUid ?? "").trim();
     const holdId = String(job.holdId ?? "").trim();
 
-    // 4) Delete hold timeBlock if we have enough info
+    // 4) Best-effort delete hold timeBlock
     if (providerUid && holdId) {
       await db
         .collection("serviceProviders")
@@ -66,11 +80,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         .catch(() => {});
     }
 
-    // 5) Clear job fields (and set status)
+    // 5) Clear job selection fields + set status to rematch
     await jobRef.set(
       {
-        status: "cancelled_by_client",
+        status: "rematch",
         selectedProviderUid: admin.firestore.FieldValue.delete(),
+        providerName: admin.firestore.FieldValue.delete(),
         holdId: admin.firestore.FieldValue.delete(),
         holdExpiresAt: admin.firestore.FieldValue.delete(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -78,11 +93,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       { merge: true },
     );
 
+    // 6) Notify previous provider (tap should open the correct recurring job manage/details flow)
+    // We route to Updated Job Details (provider), since your app routes this reliably.
+    if (providerUid) {
+      await notifyToTopic(`user_${providerUid}`, {
+        type: "provider_recurring_rematched",
+        jobId: jobRequestId,
+        route: "/updated_job_details_provider",
+      });
+    }
+
     return res.status(200).json({ ok: true });
   } catch (err: any) {
-    console.error("cancel-hold error:", err);
+    console.error("client-rematch error:", err);
     return res.status(500).json({
-      error: "Failed to cancel hold.",
+      error: "Failed to rematch.",
       code: err?.code,
       message: err?.message,
     });
