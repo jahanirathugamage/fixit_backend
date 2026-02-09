@@ -4,7 +4,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
 
-const MIRROR_VERSION = "vercel-create-provider-v2-mirror-skills-proof";
+const MIRROR_VERSION = "vercel-create-provider-v2-mirror-skills-readback";
 
 function normalizeAddress(input: string): string {
   const raw = String(input || "").trim();
@@ -74,7 +74,7 @@ function parsePinnedLocation(raw: any): Geo | null {
 
 /**
  * Keep skills structure EXACTLY (Flutter expects skills[0].education/certifications/jobExperience).
- * We only ensure it’s an array of objects.
+ * Only ensure array-of-objects.
  */
 function sanitizeSkills(raw: any): any[] {
   if (!Array.isArray(raw)) return [];
@@ -135,10 +135,7 @@ async function geocodeAddress(
 
     return {
       geo: { lat, lng },
-      meta: {
-        query,
-        displayName: data[0].display_name ?? null,
-      },
+      meta: { query, displayName: data[0].display_name ?? null },
     };
   } catch {
     return null;
@@ -240,7 +237,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const providerUid = userRecord.uid;
     const contractorRef = admin.firestore().doc(`contractors/${callerUid}`);
 
-    // 5) Create/merge users/{providerUid}
+    // 5) users/{providerUid}
     await admin.firestore().collection("users").doc(providerUid).set(
       {
         role: "provider",
@@ -315,8 +312,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       { merge: true },
     );
 
-    // 8) ✅ Mirror into serviceProviders/{providerUid}
-    await admin.firestore().collection("serviceProviders").doc(providerUid).set(
+    // 8) Mirror into serviceProviders/{providerUid}
+    const spRef = admin.firestore().collection("serviceProviders").doc(providerUid);
+
+    await spRef.set(
       {
         providerUid,
         providerEmail: mail,
@@ -332,20 +331,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         categories: finalCategories,
         categoriesNormalized: finalCategoriesNormalized,
 
-        // ✅ THE IMPORTANT FIELD
+        // ✅ the important one
         skills: finalSkills,
 
-        // ✅ PROOF FIELDS (verify deployed version)
         mirrorVersion: MIRROR_VERSION,
-        skillsCount,
-        mirroredAt: FieldValue.serverTimestamp(),
         mirroredFromProviderDocId: providerId,
+        skillsCount,
 
         ...geoFields,
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
+
+    // ✅ READ BACK what was actually saved (proves deployment + project)
+    const spSnap = await spRef.get();
+    const spData = spSnap.data() || {};
+    const serviceProvidersHasSkills =
+      Array.isArray(spData.skills) && spData.skills.length > 0;
 
     // 9) Email
     const subject = "Your FixIt provider account";
@@ -365,6 +368,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       providerUid,
       mirrorVersion: MIRROR_VERSION,
       skillsCount,
+      serviceProvidersHasSkills,
+      serviceProvidersKeys: Object.keys(spData),
+      projectId: admin.app().options.projectId ?? null,
     });
   } catch (err: any) {
     console.error("create-provider-account error:", err);
