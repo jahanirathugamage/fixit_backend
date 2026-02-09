@@ -1,15 +1,15 @@
 {
   "crons": [
     {
-      "path": "/api/recurring-reminders",
-      "schedule": "*/15 * * * *",
+      "path": "/api/cron/generate-recurring-jobs",
+      "schedule": "0 2 * * *",
       "headers": {
         "Authorization": "Bearer ${CRON_SECRET}"
       }
     },
     {
-      "path": "/api/cron/generate-recurring-jobs",
-      "schedule": "0 */6 * * *",
+      "path": "/api/cron/recurring-reminders",
+      "schedule": "10 2 * * *",
       "headers": {
         "Authorization": "Bearer ${CRON_SECRET}"
       }
