@@ -4,7 +4,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { admin } from "@/lib/firebaseAdmin";
 import { sendEmail } from "@/lib/mailer";
 
-const MIRROR_VERSION = "vercel-create-provider-v1-mirror-skills";
+const MIRROR_VERSION = "vercel-create-provider-v2-mirror-skills-proof";
 
 function normalizeAddress(input: string): string {
   const raw = String(input || "").trim();
@@ -82,7 +82,7 @@ function sanitizeSkills(raw: any): any[] {
 }
 
 async function geocodeAddress(
-  address: string
+  address: string,
 ): Promise<{ geo: Geo; meta: { query: string; displayName?: string | null } } | null> {
   const query = String(address || "").trim();
   if (query.length < 6) return null;
@@ -222,7 +222,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         ? sanitizeStringArray(contractorProviderData?.categoriesNormalized)
         : sanitizeStringArray(categoriesNormalized);
 
-    // ✅ skills from contractor doc if present (includes education/certs/jobExperience)
+    // ✅ skills from contractor doc if present
     const finalSkills =
       Array.isArray(contractorProviderData?.skills) && contractorProviderData.skills.length > 0
         ? sanitizeSkills(contractorProviderData.skills)
@@ -251,7 +251,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       },
-      { merge: true }
+      { merge: true },
     );
 
     // 6) Geo (pin > nominatim)
@@ -312,7 +312,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         categoriesNormalized: finalCategoriesNormalized,
         ...geoFields,
       },
-      { merge: true }
+      { merge: true },
     );
 
     // 8) ✅ Mirror into serviceProviders/{providerUid}
@@ -332,18 +332,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         categories: finalCategories,
         categoriesNormalized: finalCategoriesNormalized,
 
-        // ✅ This is the key: your Flutter reads skills[0].education/certifications/jobExperience
+        // ✅ THE IMPORTANT FIELD
         skills: finalSkills,
 
-        // ✅ proof fields
+        // ✅ PROOF FIELDS (verify deployed version)
         mirrorVersion: MIRROR_VERSION,
-        mirroredFromProviderDocId: providerId,
         skillsCount,
+        mirroredAt: FieldValue.serverTimestamp(),
+        mirroredFromProviderDocId: providerId,
 
         ...geoFields,
         updatedAt: FieldValue.serverTimestamp(),
       },
-      { merge: true }
+      { merge: true },
     );
 
     // 9) Email
